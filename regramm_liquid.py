@@ -447,6 +447,7 @@ class ReGraMMICL(nn.Module):
         support_states = []
         for k in range(K):
             img_s = img_support[:, k, :, :, :, :]
+            ts_s = ts_support[:, k, :, :, :]
             ts_s = ts_support[:, k, :, :, :, :]
             state_s = self.encode_sequence_to_state(img_s, ts_s)
             support_states.append(state_s)
