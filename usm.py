@@ -12,8 +12,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,19 +23,16 @@ from torch.utils.data import Dataset, DataLoader
 
 @dataclass
 class USMConfig:
-    world_type: str = "hard_binding"  # "hard_binding", "gridworld", "polymarket_stub", "all"
-    seed: int = 42
+    world_type: str = "hard_binding"  # "hard_binding" or "gridworld"
+    seed: int = 0
     device: str = "cuda"
-    log_dir: str = "usm_logs"
-    run_name: str = "usm_v0_9"
     # Hard-binding specific
     hb_train_samples: int = 8000
     hb_eval_samples: int = 4000
     hb_epochs: int = 100
     hb_batch_size: int = 256
     hb_lr: float = 1e-3
-    hb_pred_loss_weight: float = 0.05
-    hb_bind_loss_weight: float = 0.5
+    hb_pred_loss_weight: float = 0.2
     # GridWorld specific
     gw_size: int = 5
     gw_n_episodes: int = 200
@@ -45,17 +40,6 @@ class USMConfig:
     gw_lr: float = 1e-3
     gw_gamma: float = 0.99
     gw_latent_dim: int = 64
-    # Polymarket stub
-    polymarket_csv_path: str = "polymarket_data.csv"
-    polymarket_use_synthetic: bool = True
-
-
-def set_global_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 
 def resolve_device(cfg: USMConfig) -> torch.device:
@@ -588,10 +572,6 @@ def compute_binding_loss(attn_q2s: torch.Tensor,
     - Simple scenes: cross-entropy to the single correct slot.
     - Ambiguous scenes: soft target over all valid candidates.
     """
-    if attn_q2s is None:
-        # If attention is unavailable (should be rare), skip binding supervision.
-        return torch.tensor(0.0, device=cand_mask.device)
-
     cand_mask = cand_mask.to(attn_q2s.device)
     amb = amb.to(attn_q2s.device).bool()
 
@@ -643,12 +623,8 @@ def run_hard_binding_experiment(cfg: USMConfig):
     print("Device:", device)
 
     # Datasets
-    train_ds = HardBindingDataset(
-        n_samples=cfg.hb_train_samples, seed=cfg.seed, permute_objects=True
-    )
-    eval_ds = HardBindingDataset(
-        n_samples=cfg.hb_eval_samples, seed=cfg.seed + 1, permute_objects=False
-    )
+    train_ds = HardBindingDataset(n_samples=cfg.hb_train_samples, seed=cfg.seed)
+    eval_ds = HardBindingDataset(n_samples=cfg.hb_eval_samples, seed=cfg.seed + 1)
 
     amb_train, amb_train_n = ambig_fraction(train_ds)
     amb_eval, amb_eval_n = ambig_fraction(eval_ds)
@@ -725,18 +701,13 @@ def run_hard_binding_experiment(cfg: USMConfig):
 
     opt_ctm = torch.optim.AdamW(ctm.parameters(), lr=cfg.hb_lr)
     pred_loss_weight = cfg.hb_pred_loss_weight
-    bind_loss_weight = cfg.hb_bind_loss_weight
-
-    avg_eff_p_final = 0.0
-    pred_loss_final = 0.0
 
     for epoch in range(1, cfg.hb_epochs + 1):
         ctm.train()
         running_eff_p = 0.0
         running_batches = 0
         last_pred_loss_val = 0.0
-        last_bind_loss_val = 0.0
-        attn_debug_stats: Optional[Tuple[float, float, float, bool]] = None
+        attn_debug_stats = None
 
         for x, y, amb, cand_mask in train_loader:
             x = x.to(device)
@@ -746,8 +717,10 @@ def run_hard_binding_experiment(cfg: USMConfig):
 
             want_attn = attn_debug_stats is None and (epoch % 20 == 0)
 
+            want_attn = attn_debug_stats is None and (epoch % 20 == 0)
+
             opt_ctm.zero_grad()
-            logits, pred_loss, eff_p_mean, attn_q2s = ctm(x, return_attn=True)
+            logits, pred_loss, eff_p_mean, attn_q2s = ctm(x, return_attn=want_attn)
             loss_cls = ce(logits, y)
             bind_loss = compute_binding_loss(attn_q2s, cand_mask, amb)
             loss = loss_cls + pred_loss_weight * pred_loss + bind_loss_weight * bind_loss
@@ -756,8 +729,7 @@ def run_hard_binding_experiment(cfg: USMConfig):
 
             running_eff_p += float(eff_p_mean)
             running_batches += 1
-            last_pred_loss_val = float(pred_loss.detach().item())
-            last_bind_loss_val = float(bind_loss.detach().item())
+            last_pred_loss_val = pred_loss.detach().item()
 
             if want_attn and attn_q2s is not None:
                 with torch.no_grad():
@@ -769,7 +741,7 @@ def run_hard_binding_experiment(cfg: USMConfig):
                         bool(attn_q2s.requires_grad),
                     )
 
-        if epoch % 20 == 0 or epoch == cfg.hb_epochs:
+        if epoch % 20 == 0:
             acc, acc_simple, acc_amb = evaluate_model(ctm, eval_loader, device)
             avg_eff_p = running_eff_p / max(1, running_batches)
             if attn_debug_stats is not None:
@@ -780,9 +752,7 @@ def run_hard_binding_experiment(cfg: USMConfig):
                   f"Eval: {acc*100:4.1f}% | "
                   f"Simple: {acc_simple*100:4.1f}% | "
                   f"Ambig: {acc_amb*100:4.1f}% | "
-                  f"PredLoss: {last_pred_loss_val:.4f} | "
-                  f"BindLoss: {last_bind_loss_val:.4f} | "
-                  f"eff_p: {avg_eff_p:.2f}")
+                  f"PredLoss: {last_pred_loss_val:.4f} | eff_p: {avg_eff_p:.2f}")
             avg_eff_p_final = avg_eff_p
             pred_loss_final = last_pred_loss_val
 
@@ -836,36 +806,6 @@ def run_hard_binding_experiment(cfg: USMConfig):
     print("\n" + "=" * 60)
     print("v1.0 HARD BINDING COMPLETE")
     print("=" * 60)
-
-    results = {
-        "world": "hard_binding",
-        "n_train": len(train_ds),
-        "n_eval": len(eval_ds),
-        "ambig_fraction_train": amb_train,
-        "ambig_fraction_eval": amb_eval,
-        "mlp": {
-            "eval_acc": mlp_overall,
-            "simple_acc": mlp_simple,
-            "ambig_acc": mlp_amb,
-            "n_params": n_params_mlp,
-        },
-        "ctm": {
-            "eval_acc": ctm_overall,
-            "simple_acc": ctm_simple,
-            "ambig_acc": ctm_amb,
-            "n_params": n_params_ctm,
-            "avg_eff_p": avg_eff_p_final,
-            "pred_loss": pred_loss_final,
-            "bind_loss": last_bind_loss_val,
-        },
-        "binding_probes": {
-            "argmax_acc_overall": bind_overall,
-            "argmax_acc_simple": bind_simple,
-            "argmax_acc_ambig": bind_amb,
-            "mean_correct_mass": mass_mean,
-        },
-    }
-    return results
 
 
 # ---------------------------------------------------------------------
@@ -1174,119 +1114,19 @@ def run_gridworld_experiment(cfg: USMConfig):
     print("GRIDWORLD TRAINING COMPLETE")
     print("=" * 60)
 
-    last_k = min(100, len(reward_history))
-    success_rate_last_k = sum(success_history[-last_k:]) / max(1, last_k)
-    avg_return_last_k = sum(reward_history[-last_k:]) / max(1, last_k)
-
-    results = {
-        "world": "gridworld",
-        "n_episodes": cfg.gw_n_episodes,
-        "max_steps": cfg.gw_max_steps,
-        "success_rate_last_k": success_rate_last_k,
-        "avg_return_last_k": avg_return_last_k,
-        "hypergraph": {
-            "num_experiences": len(hypergraph.experience_ids),
-        },
-    }
-    return results
-
-
-# ---------------------------------------------------------------------
-# POLYMARKET STUB
-# ---------------------------------------------------------------------
-
-def run_polymarket_stub(cfg: USMConfig) -> dict:
-    print("\n" + "=" * 60)
-    print("USM: POLYMARKET STUB")
-    print("=" * 60)
-    print("This is a placeholder for a real PolymarketWorld.")
-    print(f"CSV path: {cfg.polymarket_csv_path}")
-    print(f"use_synthetic: {cfg.polymarket_use_synthetic}")
-    print("For now, this just returns a dummy metrics dict.\n")
-
-    metrics = {
-        "world": "polymarket_stub",
-        "csv_path": cfg.polymarket_csv_path,
-        "use_synthetic": cfg.polymarket_use_synthetic,
-        "status": "stub",
-    }
-    return metrics
-
-
-# ---------------------------------------------------------------------
-# UNIFIED USM CELL RUNNER
-# ---------------------------------------------------------------------
-
-def run_usm_cell(cfg: USMConfig) -> dict:
-    """
-    Unified USM cell runner.
-
-    Depending on cfg.world_type, runs:
-      - 'hard_binding': hard binding CTM vs MLP experiment
-      - 'gridworld': gridworld USM experiment
-      - 'polymarket_stub': polymarket stub
-      - 'all': runs all three and aggregates metrics
-
-    Returns:
-        A dict with per-world metrics.
-    """
-    set_global_seed(cfg.seed)
-
-    all_results: Dict[str, Any] = {}
-
-    if cfg.world_type in ("hard_binding", "all"):
-        hb_results = run_hard_binding_experiment(cfg)
-        all_results["hard_binding"] = hb_results
-
-    if cfg.world_type in ("gridworld", "all"):
-        gw_results = run_gridworld_experiment(cfg)
-        all_results["gridworld"] = gw_results
-
-    if cfg.world_type in ("polymarket_stub", "all"):
-        pm_results = run_polymarket_stub(cfg)
-        all_results["polymarket_stub"] = pm_results
-
-    return all_results
-
 
 # ---------------------------------------------------------------------
 # ENTRY POINT
 # ---------------------------------------------------------------------
 
 def main():
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--world_type", type=str, default="hard_binding",
-                        choices=["hard_binding", "gridworld", "polymarket_stub", "all"])
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
-
-    cfg = USMConfig(world_type=args.world_type, seed=args.seed)
-
-    print(f"Device: {device}")
-    print("=" * 60)
-    print("USM v0.9: Unified USM Cell (Hard Binding + GridWorld + Polymarket Stub)")
-    print("=" * 60)
-
-    results = run_usm_cell(cfg)
-
-    print("\n" + "=" * 60)
-    print("USM SUMMARY")
-    print("=" * 60)
-    for world_name, metrics in results.items():
-        print(f"\n[{world_name}]")
-        for k, v in metrics.items():
-            if isinstance(v, dict):
-                print(f"  {k}:")
-                for kk, vv in v.items():
-                    print(f"    {kk}: {vv}")
-            else:
-                print(f"  {k}: {v}")
-
-    print("\n" + "=" * 60)
-    print("USM v0.9 COMPLETE")
-    print("=" * 60)
+    cfg = USMConfig()
+    if cfg.world_type == "hard_binding":
+        run_hard_binding_experiment(cfg)
+    elif cfg.world_type == "gridworld":
+        run_gridworld_experiment(cfg)
+    else:
+        raise ValueError(f"Unknown world_type: {cfg.world_type}")
 
 
 if __name__ == "__main__":
