@@ -84,9 +84,10 @@ class HardBindingDataset(Dataset):
     SHAPES = ["ball", "cube", "cone", "star"]
     RELS = ["left_of", "right_of", "above", "below"]
 
-    def __init__(self, n_samples: int = 8000, seed: int = 0):
+    def __init__(self, n_samples: int = 8000, seed: int = 0, permute_objects: bool = False):
         self.n_samples = n_samples
         self.rng = random.Random(seed)
+        self.permute_objects = permute_objects
         # (x, y, ambiguous, cand_mask, objects, query)
         self.samples: List[Tuple[torch.Tensor, int, bool, torch.Tensor, list, tuple]] = []
         self._generate()
@@ -190,6 +191,16 @@ class HardBindingDataset(Dataset):
 
     def __getitem__(self, idx):
         x, y, amb, cand_mask, objects, query = self.samples[idx]
+        x = x.clone()
+        cand_mask = cand_mask.clone()
+
+        if self.permute_objects:
+            obj_feats = x[:40].view(4, 10)
+            perm = torch.randperm(4)
+            obj_feats = obj_feats[perm]
+            x[:40] = obj_feats.view(-1)
+            cand_mask = cand_mask[perm]
+
         return x, y, amb, cand_mask
 
     def sample_humans(self, k: int = 3):
@@ -551,6 +562,51 @@ def evaluate_binding(ctm: CTMHierModel, loader, device, n_obj_slots: int = 4):
     return overall, simple, amb, mean_mass
 
 
+def compute_binding_loss(attn_q2s: torch.Tensor,
+                         cand_mask: torch.Tensor,
+                         amb: torch.Tensor,
+                         eps: float = 1e-8) -> torch.Tensor:
+    """
+    Supervised binding loss for query→object attention.
+
+    - Simple scenes: cross-entropy to the single correct slot.
+    - Ambiguous scenes: soft target over all valid candidates.
+    """
+    cand_mask = cand_mask.to(attn_q2s.device)
+    amb = amb.to(attn_q2s.device).bool()
+
+    simple_mask = ~amb
+    loss_terms = []
+
+    if simple_mask.any():
+        idx = simple_mask.nonzero(as_tuple=False).squeeze(-1)
+        attn_simple = attn_q2s[idx]
+        cand_simple = cand_mask[idx].float()
+        target_idx = cand_simple.argmax(dim=-1)
+        log_attn = (attn_simple + eps).log()
+        ce_simple = F.nll_loss(log_attn, target_idx, reduction="mean")
+        loss_terms.append(ce_simple)
+
+    if amb.any():
+        idx = amb.nonzero(as_tuple=False).squeeze(-1)
+        attn_amb = attn_q2s[idx]
+        cand_amb = cand_mask[idx].float()
+        cand_sum = cand_amb.sum(dim=-1, keepdim=True)
+        valid = cand_sum.squeeze(-1) > 0
+        if valid.any():
+            attn_amb = attn_amb[valid]
+            cand_amb = cand_amb[valid]
+            cand_soft = cand_amb / (cand_sum[valid] + eps)
+            log_attn = (attn_amb + eps).log()
+            ce_amb = -(cand_soft * log_attn).sum(dim=-1).mean()
+            loss_terms.append(ce_amb)
+
+    if not loss_terms:
+        return torch.tensor(0.0, device=attn_q2s.device)
+
+    return torch.stack(loss_terms).mean()
+
+
 # ---------------------------------------------------------------------
 # HARD BINDING EXPERIMENT WRAPPER
 # ---------------------------------------------------------------------
@@ -656,13 +712,18 @@ def run_hard_binding_experiment(cfg: USMConfig):
         for x, y, amb, cand_mask in train_loader:
             x = x.to(device)
             y = y.to(device)
+            amb = amb.to(device)
+            cand_mask = cand_mask.to(device)
+
+            want_attn = attn_debug_stats is None and (epoch % 20 == 0)
 
             want_attn = attn_debug_stats is None and (epoch % 20 == 0)
 
             opt_ctm.zero_grad()
             logits, pred_loss, eff_p_mean, attn_q2s = ctm(x, return_attn=want_attn)
             loss_cls = ce(logits, y)
-            loss = loss_cls + pred_loss_weight * pred_loss
+            bind_loss = compute_binding_loss(attn_q2s, cand_mask, amb)
+            loss = loss_cls + pred_loss_weight * pred_loss + bind_loss_weight * bind_loss
             loss.backward()
             opt_ctm.step()
 
