@@ -651,7 +651,7 @@ def run_hard_binding_experiment(cfg: USMConfig):
         running_eff_p = 0.0
         running_batches = 0
         last_pred_loss_val = 0.0
-        attn_debug_stats: Optional[Tuple[float, float, float, bool]] = None
+        attn_debug_stats = None
 
         for x, y, amb, cand_mask in train_loader:
             x = x.to(device)
@@ -680,7 +680,7 @@ def run_hard_binding_experiment(cfg: USMConfig):
                         bool(attn_q2s.requires_grad),
                     )
 
-        if epoch % 20 == 0 or epoch == cfg.hb_epochs:
+        if epoch % 20 == 0:
             acc, acc_simple, acc_amb = evaluate_model(ctm, eval_loader, device)
             avg_eff_p = running_eff_p / max(1, running_batches)
             if attn_debug_stats is not None:
