@@ -9,13 +9,14 @@ Original file is located at
 
 # @title
 # -*- coding: utf-8 -*-
-"""USM v1.1: Unified Science Machine
+"""USM v1.2: Unified Science Machine
 
 Hard Binding:
   - 4-object relational binding task
   - 2-layer CTM (fast+slow) with LTC, adaptive p, latent prediction loss
-  - Supervised query→object binding loss
-  - Object-permutation invariance for training
+  - Supervised query→object binding loss (annealed)
+  - Slot probes for color/shape/position
+  - Object-permutation invariance for training & eval
 
 GridWorld:
   - Minimal 5x5 GridWorld
@@ -54,7 +55,11 @@ class USMConfig:
     hb_batch_size: int = 256
     hb_lr: float = 1e-3
     hb_pred_loss_weight: float = 0.2
-    hb_bind_loss_weight: float = 0.5  # new: weight for binding supervision
+    hb_permute_objects: bool = True
+    hb_bind_loss_weight: float = 1.0
+    hb_bind_loss_warmup_epochs: int = 20
+    hb_bind_loss_max_epochs: int = 80
+    hb_probe_loss_weight: float = 0.1
 
     # GridWorld specific
     gw_size: int = 5
@@ -223,14 +228,27 @@ class HardBindingDataset(Dataset):
         x = x.clone()
         cand_mask = cand_mask.clone()
 
+        obj_colors_idx = torch.tensor(
+            [self.COLORS.index(obj["color"]) for obj in objects], dtype=torch.long
+        )
+        obj_shapes_idx = torch.tensor(
+            [self.SHAPES.index(obj["shape"]) for obj in objects], dtype=torch.long
+        )
+        obj_pos = torch.tensor(
+            [[obj["x"], obj["y"]] for obj in objects], dtype=torch.float32
+        )
+
         if self.permute_objects:
             obj_feats = x[:40].view(4, 10)
             perm = torch.randperm(4)
             obj_feats = obj_feats[perm]
             x[:40] = obj_feats.view(-1)
             cand_mask = cand_mask[perm]
+            obj_colors_idx = obj_colors_idx[perm]
+            obj_shapes_idx = obj_shapes_idx[perm]
+            obj_pos = obj_pos[perm]
 
-        return x, y, amb, cand_mask
+        return x, y, amb, cand_mask, obj_colors_idx, obj_shapes_idx, obj_pos
 
     def sample_humans(self, k: int = 3):
         """Return a few human-readable examples for logging."""
@@ -410,6 +428,11 @@ class CTMHierModel(nn.Module):
         # Per-slot shape head (object-wise logits)
         self.slot_shape_head = nn.Linear(slot_dim, n_classes)
 
+        # Diagnostic probe heads
+        self.probe_color = nn.Linear(self.slot_dim, 4)
+        self.probe_shape = nn.Linear(self.slot_dim, 4)
+        self.probe_pos = nn.Linear(self.slot_dim, 2)
+
     def encode_slots(self, x):
         """
         x: [B, 52]
@@ -428,7 +451,7 @@ class CTMHierModel(nn.Module):
         z0 = torch.cat([obj_emb, query_emb], dim=1)                    # [B,5,D]
         return z0
 
-    def forward(self, x, return_attn: bool = False):
+    def forward(self, x, return_attn: bool = False, return_slots: bool = False):
         """
         x: [B, 52]
         Returns:
@@ -471,6 +494,9 @@ class CTMHierModel(nn.Module):
         if not return_attn:
             attn_q2s = None
 
+        if return_slots:
+            return final_logits, pred_loss, eff_p_mean, attn_q2s, slots
+
         return final_logits, pred_loss, eff_p_mean, attn_q2s
 
 
@@ -485,7 +511,7 @@ def evaluate_model(model, loader, device):
     correct_amb = total_amb = 0
 
     with torch.no_grad():
-        for x, y, amb, cand_mask in loader:
+        for x, y, amb, cand_mask, _, _, _ in loader:
             x = x.to(device)
             y = y.to(device)
 
@@ -541,7 +567,7 @@ def evaluate_binding(ctm: CTMHierModel, loader, device, n_obj_slots: int = 4):
     mass_count = 0
 
     with torch.no_grad():
-        for x, y, amb, cand_mask in loader:
+        for x, y, amb, cand_mask, _, _, _ in loader:
             x = x.to(device)
             amb = amb.to(torch.bool)
             cand_mask = cand_mask.to(device)  # [B,4]
@@ -639,6 +665,15 @@ def compute_binding_loss(attn_q2s: torch.Tensor,
     return torch.stack(loss_terms).mean()
 
 
+def binding_weight_for_epoch(epoch: int, warmup: int, max_ep: int, max_w: float) -> float:
+    if epoch < warmup:
+        return 0.0
+    if epoch >= max_ep:
+        return max_w
+    alpha = (epoch - warmup) / max(1, max_ep - warmup)
+    return float(alpha * max_w)
+
+
 # ---------------------------------------------------------------------
 # HARD BINDING EXPERIMENT
 # ---------------------------------------------------------------------
@@ -650,7 +685,10 @@ def run_hard_binding_experiment(cfg: USMConfig):
     random.seed(cfg.seed)
 
     print("=" * 60)
-    print("USM v1.1: HARD BINDING + 2-LAYER CTM + ADAPTIVE p + LATENT PRED + BINDING LOSS + PROBES")
+    print(
+        "USM v1.2: HARD BINDING + 2-LAYER CTM + ADAPTIVE p + LATENT PRED"
+        " + BINDING LOSS (ANNEALED) + PROBES + PERM-INVARIANT"
+    )
     print("=" * 60)
     print("Device:", device)
 
@@ -658,12 +696,12 @@ def run_hard_binding_experiment(cfg: USMConfig):
     train_ds = HardBindingDataset(
         n_samples=cfg.hb_train_samples,
         seed=cfg.seed,
-        permute_objects=True,   # enforce permutation invariance
+        permute_objects=cfg.hb_permute_objects,
     )
     eval_ds = HardBindingDataset(
         n_samples=cfg.hb_eval_samples,
         seed=cfg.seed + 1,
-        permute_objects=False,  # clean eval
+        permute_objects=cfg.hb_permute_objects,
     )
 
     amb_train, amb_train_n = ambig_fraction(train_ds)
@@ -711,7 +749,7 @@ def run_hard_binding_experiment(cfg: USMConfig):
 
     for epoch in range(1, cfg.hb_epochs + 1):
         mlp.train()
-        for x, y, amb, cand_mask in train_loader:
+        for x, y, amb, cand_mask, _, _, _ in train_loader:
             x = x.to(device)
             y = y.to(device)
             opt_mlp.zero_grad()
@@ -735,7 +773,9 @@ def run_hard_binding_experiment(cfg: USMConfig):
 
     opt_ctm = torch.optim.AdamW(ctm.parameters(), lr=cfg.hb_lr)
     pred_loss_weight = cfg.hb_pred_loss_weight
-    bind_loss_weight = cfg.hb_bind_loss_weight
+    bind_loss_weight_max = cfg.hb_bind_loss_weight
+    bind_warmup = cfg.hb_bind_loss_warmup_epochs
+    bind_max_ep = cfg.hb_bind_loss_max_epochs
 
     for epoch in range(1, cfg.hb_epochs + 1):
         ctm.train()
@@ -743,22 +783,49 @@ def run_hard_binding_experiment(cfg: USMConfig):
         running_batches = 0
         last_pred_loss_val = 0.0
         last_bind_loss_val = 0.0
+        last_probe_loss_val = 0.0
         attn_debug_stats = None
+        bind_w = binding_weight_for_epoch(epoch, bind_warmup, bind_max_ep, bind_loss_weight_max)
 
-        for x, y, amb, cand_mask in train_loader:
+        for x, y, amb, cand_mask, obj_colors, obj_shapes, obj_pos in train_loader:
             x = x.to(device)
             y = y.to(device)
             amb = amb.to(device)
             cand_mask = cand_mask.to(device)
+            obj_colors = obj_colors.to(device)
+            obj_shapes = obj_shapes.to(device)
+            obj_pos = obj_pos.to(device)
 
             # Always request attention; we need it for binding loss
             opt_ctm.zero_grad()
-            logits, pred_loss, eff_p_mean, attn_q2s = ctm(x, return_attn=True)
+            logits, pred_loss, eff_p_mean, attn_q2s, slots = ctm(
+                x, return_attn=True, return_slots=True
+            )
 
             loss_cls = ce(logits, y)
             bind_loss = compute_binding_loss(attn_q2s, cand_mask, amb)
 
-            loss = loss_cls + pred_loss_weight * pred_loss + bind_loss_weight * bind_loss
+            B, N, D = slots.shape
+            slots_flat = slots.reshape(B * N, D)
+            colors_flat = obj_colors.view(B * N)
+            shapes_flat = obj_shapes.view(B * N)
+            pos_flat = obj_pos.view(B * N, 2)
+
+            color_logits = ctm.probe_color(slots_flat)
+            shape_logits = ctm.probe_shape(slots_flat)
+            pos_pred = ctm.probe_pos(slots_flat)
+
+            loss_color = F.cross_entropy(color_logits, colors_flat)
+            loss_shape = F.cross_entropy(shape_logits, shapes_flat)
+            loss_pos = F.mse_loss(pos_pred, pos_flat)
+            probe_loss = loss_color + loss_shape + loss_pos
+
+            loss = (
+                loss_cls
+                + pred_loss_weight * pred_loss
+                + bind_w * bind_loss
+                + cfg.hb_probe_loss_weight * probe_loss
+            )
             loss.backward()
             opt_ctm.step()
 
@@ -766,8 +833,9 @@ def run_hard_binding_experiment(cfg: USMConfig):
             running_batches += 1
             last_pred_loss_val = pred_loss.detach().item()
             last_bind_loss_val = bind_loss.detach().item()
+            last_probe_loss_val = probe_loss.detach().item()
 
-            if attn_debug_stats is None:
+            if attn_debug_stats is None and attn_q2s is not None:
                 with torch.no_grad():
                     attn_sum = attn_q2s.sum(dim=-1)
                     attn_debug_stats = (
@@ -790,6 +858,8 @@ def run_hard_binding_experiment(cfg: USMConfig):
                   f"Ambig: {acc_amb*100:4.1f}% | "
                   f"PredLoss: {last_pred_loss_val:.4f} | "
                   f"BindLoss: {last_bind_loss_val:.4f} | "
+                  f"ProbeLoss: {last_probe_loss_val:.4f} | "
+                  f"BindW: {bind_w:.3f} | "
                   f"eff_p: {avg_eff_p:.2f}")
 
     # Final classification comparison
@@ -837,8 +907,52 @@ def run_hard_binding_experiment(cfg: USMConfig):
     print(f"  Ambig:   {bind_amb*100:4.1f}%")
     print(f"\nMean attention mass on correct candidate(s): {mass_mean*100:4.1f}%")
 
+    # Probe diagnostics
+    ctm.eval()
+    probe_color_correct = 0
+    probe_shape_correct = 0
+    probe_total = 0
+    pos_mse_sum = 0.0
+    pos_count = 0
+    with torch.no_grad():
+        for x, y, amb, cand_mask, obj_colors, obj_shapes, obj_pos in eval_loader:
+            x = x.to(device)
+            obj_colors = obj_colors.to(device)
+            obj_shapes = obj_shapes.to(device)
+            obj_pos = obj_pos.to(device)
+
+            _, _, _, _, slots = ctm(x, return_attn=False, return_slots=True)
+            B, N, D = slots.shape
+            slots_flat = slots.reshape(B * N, D)
+            colors_flat = obj_colors.view(B * N)
+            shapes_flat = obj_shapes.view(B * N)
+            pos_flat = obj_pos.view(B * N, 2)
+
+            color_logits = ctm.probe_color(slots_flat)
+            shape_logits = ctm.probe_shape(slots_flat)
+            pos_pred = ctm.probe_pos(slots_flat)
+
+            color_pred = color_logits.argmax(dim=-1)
+            shape_pred = shape_logits.argmax(dim=-1)
+
+            probe_color_correct += (color_pred == colors_flat).sum().item()
+            probe_shape_correct += (shape_pred == shapes_flat).sum().item()
+            probe_total += colors_flat.numel()
+
+            pos_mse_sum += F.mse_loss(pos_pred, pos_flat, reduction="sum").item()
+            pos_count += pos_flat.numel()
+
+    probe_color_acc = probe_color_correct / max(1, probe_total)
+    probe_shape_acc = probe_shape_correct / max(1, probe_total)
+    probe_pos_mse = pos_mse_sum / max(1, pos_count)
+
+    print("\nPROBE METRICS (Slots → object attributes):")
+    print(f"  Color accuracy: {probe_color_acc*100:4.1f}%")
+    print(f"  Shape accuracy: {probe_shape_acc*100:4.1f}%")
+    print(f"  Position MSE:   {probe_pos_mse:.4f}")
+
     print("\n" + "=" * 60)
-    print("v1.1 HARD BINDING COMPLETE")
+    print("v1.2 HARD BINDING COMPLETE")
     print("=" * 60)
 
 
