@@ -9,7 +9,7 @@ Original file is located at
 
 # @title
 # -*- coding: utf-8 -*-
-"""USM v1.3: Unified Science Machine – Hard Binding CTM Core
+"""USM v1.4: Unified Science Machine – Hard Binding CTM Core
 
 This file implements:
 
@@ -46,11 +46,12 @@ This file implements:
 Everything is self-contained in one file / cell.
 """
 
+import itertools
 import math
 import random
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -80,6 +81,12 @@ class USMConfig:
     # Latent prediction loss
     hb_pred_loss_weight: float = 0.2
 
+    # Generalization + robustness
+    hb_split_mode: str = "iid"          # "iid" or "heldout_pairs"
+    hb_coord_jitter: float = 0.0        # e.g. 0.02 for light jitter in continuous coords
+    hb_permute_train: bool = True       # whether to permute objects during training
+    hb_permute_eval: bool = True        # whether to permute objects during eval
+
     # Binding supervision
     hb_bind_loss_weight_max: float = 3.0
     hb_bind_loss_warmup_epochs: int = 10
@@ -90,10 +97,6 @@ class USMConfig:
 
     # Attention entropy regularizer (encourages sharper bindings)
     hb_attn_entropy_weight: float = 0.03
-
-    # Permutation invariance: randomize object order at every sample
-    hb_permute_objects_train: bool = True
-    hb_permute_objects_eval: bool = True
 
     # GridWorld specific
     gw_size: int = 5
@@ -147,11 +150,27 @@ class HardBindingDataset(Dataset):
     SHAPES = ["ball", "cube", "cone", "star"]
     RELS = ["left_of", "right_of", "above", "below"]
 
-    def __init__(self, n_samples: int = 8000, seed: int = 0,
-                 permute_objects: bool = False):
+    def __init__(
+        self,
+        n_samples: int = 8000,
+        seed: int = 0,
+        permute_objects: bool = False,
+        coord_jitter: float = 0.0,
+        allowed_patterns: Optional[List[Tuple[int, int, int]]] = None,
+    ):
+        """
+        allowed_patterns: optional list of (target_color_idx, rel_idx, ref_color_idx)
+                          triples that this dataset is allowed to sample.
+                          If None, all patterns are allowed (iid case).
+        """
+
         self.n_samples = n_samples
         self.rng = random.Random(seed)
         self.permute_objects = permute_objects
+        self.coord_jitter = coord_jitter
+        self.allowed_patterns = None
+        if allowed_patterns is not None:
+            self.allowed_patterns = set(tuple(map(int, t)) for t in allowed_patterns)
 
         # Generate canonical (non-permuted) samples; permutation is applied in __getitem__
         # Each sample: dict with keys:
@@ -183,67 +202,81 @@ class HardBindingDataset(Dataset):
         shapes = self.SHAPES
         rels = self.RELS
 
-        # 4 random objects
-        objects = []
-        for _ in range(4):
-            obj = {
-                "color": self.rng.choice(colors),
-                "shape": self.rng.choice(shapes),
-                "x": self._sample_coord(),
-                "y": self._sample_coord(),
-            }
-            objects.append(obj)
-
-        # Query + label
-        attempts = 0
+        outer_attempts = 0
         while True:
-            attempts += 1
-            ref_idx = self.rng.randrange(4)
-            ref = objects[ref_idx]
-            ref_color = ref["color"]
+            outer_attempts += 1
 
-            target_color = self.rng.choice(colors)
-            rel = self.rng.choice(rels)
+            # 4 random objects
+            objects = []
+            for _ in range(4):
+                obj = {
+                    "color": self.rng.choice(colors),
+                    "shape": self.rng.choice(shapes),
+                    "x": self._sample_coord(),
+                    "y": self._sample_coord(),
+                }
+                objects.append(obj)
 
-            # Candidate targets: objects of target_color in relation to any object of ref_color
-            candidates = []
-            for i, obj in enumerate(objects):
-                if obj["color"] != target_color:
+            # Query + label
+            attempts = 0
+            while True:
+                attempts += 1
+                ref_idx = self.rng.randrange(4)
+                ref = objects[ref_idx]
+                ref_color = ref["color"]
+
+                target_color = self.rng.choice(colors)
+                rel = self.rng.choice(rels)
+
+                # Candidate targets: objects of target_color in relation to any object of ref_color
+                candidates = []
+                for i, obj in enumerate(objects):
+                    if obj["color"] != target_color:
+                        continue
+                    holds_any = False
+                    for j, ref2 in enumerate(objects):
+                        if ref2["color"] == ref_color and i != j:
+                            if self._relation_holds(obj, ref2, rel):
+                                holds_any = True
+                                break
+                    if holds_any:
+                        candidates.append(i)
+
+                if candidates:
+                    break
+                if attempts > 20:
+                    # Fallback: no candidate, treat as non-ambiguous random label
+                    candidates = [self.rng.randrange(4)]
+                    break
+
+            t_idx = colors.index(target_color)
+            r_idx = colors.index(ref_color)
+            rel_idx = rels.index(rel)
+            pattern = (t_idx, rel_idx, r_idx)
+
+            if self.allowed_patterns is not None and pattern not in self.allowed_patterns:
+                if outer_attempts < 50:
                     continue
-                holds_any = False
-                for j, ref2 in enumerate(objects):
-                    if ref2["color"] == ref_color and i != j:
-                        if self._relation_holds(obj, ref2, rel):
-                            holds_any = True
-                            break
-                if holds_any:
-                    candidates.append(i)
+                # Safety valve: accept after many attempts
 
-            if candidates:
-                break
-            if attempts > 20:
-                # Fallback: no candidate, treat as non-ambiguous random label
-                candidates = [self.rng.randrange(4)]
-                break
+            ambiguous = len(candidates) > 1
+            chosen_idx = self.rng.choice(candidates)
+            answer_shape = objects[chosen_idx]["shape"]
+            y = shapes.index(answer_shape)
 
-        ambiguous = len(candidates) > 1
-        chosen_idx = self.rng.choice(candidates)
-        answer_shape = objects[chosen_idx]["shape"]
-        y = shapes.index(answer_shape)
+            cand_mask = torch.zeros(4, dtype=torch.bool)
+            for idx in candidates:
+                cand_mask[idx] = True
 
-        cand_mask = torch.zeros(4, dtype=torch.bool)
-        for idx in candidates:
-            cand_mask[idx] = True
-
-        return {
-            "objects": objects,
-            "target_color": target_color,
-            "ref_color": ref_color,
-            "rel": rel,
-            "y": y,
-            "amb": ambiguous,
-            "cand_mask": cand_mask,
-        }
+            return {
+                "objects": objects,
+                "target_color": target_color,
+                "ref_color": ref_color,
+                "rel": rel,
+                "y": y,
+                "amb": ambiguous,
+                "cand_mask": cand_mask,
+            }
 
     def _generate(self):
         self.samples = [self._generate_one() for _ in range(self.n_samples)]
@@ -272,10 +305,16 @@ class HardBindingDataset(Dataset):
 
         # Encode features
         feat = []
+        jitter = self.coord_jitter
         for obj in objects:
+            x = obj["x"]
+            y = obj["y"]
+            if jitter > 0.0:
+                x = max(0.0, min(0.8, x + self.rng.uniform(-jitter, jitter)))
+                y = max(0.0, min(0.8, y + self.rng.uniform(-jitter, jitter)))
             color_oh = [1.0 if obj["color"] == c else 0.0 for c in colors]
             shape_oh = [1.0 if obj["shape"] == s else 0.0 for s in shapes]
-            feat.extend(color_oh + shape_oh + [obj["x"], obj["y"]])
+            feat.extend(color_oh + shape_oh + [x, y])
 
         tgt_oh = [1.0 if target_color == c else 0.0 for c in colors]
         rel_oh = [1.0 if rel == r else 0.0 for r in rels]
@@ -602,6 +641,134 @@ def evaluate_model(model, loader, device):
     return overall, simple, amb
 
 
+def decode_query_pattern(x_batch: torch.Tensor) -> torch.Tensor:
+    """
+    x_batch: [B, 52] input vectors (4*10 object features + 12 query features).
+
+    Returns:
+      patterns: [B, 3] integer tensor with (target_color_idx, rel_idx, ref_color_idx)
+    """
+    B = x_batch.size(0)
+    query = x_batch[:, 40:]  # [B,12]
+    tgt_logits = query[:, 0:4]
+    rel_logits = query[:, 4:8]
+    ref_logits = query[:, 8:12]
+
+    tgt_idx = tgt_logits.argmax(dim=-1)
+    rel_idx = rel_logits.argmax(dim=-1)
+    ref_idx = ref_logits.argmax(dim=-1)
+
+    return torch.stack([tgt_idx, rel_idx, ref_idx], dim=-1)  # [B,3]
+
+
+def evaluate_model_with_patterns(
+    model,
+    loader,
+    device,
+    heldout_patterns: Optional[List[Tuple[int, int, int]]] = None,
+):
+    """
+    Extended evaluation that splits accuracy into:
+      - overall / simple / ambiguous
+      - seen-pattern vs held-out-pattern subsets (if heldout_patterns is not None)
+
+    Returns:
+      metrics: dict with keys like:
+        "overall", "simple", "amb",
+        "seen_overall", "seen_simple", "seen_amb",
+        "heldout_overall", "heldout_simple", "heldout_amb"
+      (for the *_seen / *_heldout keys, values may be None if there are no samples)
+    """
+
+    model.eval()
+    correct = total = 0
+    correct_simple = total_simple = 0
+    correct_amb = total_amb = 0
+
+    correct_seen = total_seen = 0
+    correct_seen_simple = total_seen_simple = 0
+    correct_seen_amb = total_seen_amb = 0
+
+    correct_held = total_held = 0
+    correct_held_simple = total_held_simple = 0
+    correct_held_amb = total_held_amb = 0
+
+    heldout_set = set(tuple(p) for p in heldout_patterns) if heldout_patterns is not None else None
+
+    with torch.no_grad():
+        for x, y, amb, cand_mask in loader:
+            x = x.to(device)
+            y = y.to(device)
+
+            if isinstance(model, CTMHierModel):
+                logits, _, _, _, _ = model(x, return_attn=False, return_slots=False)
+            else:
+                logits = model(x)
+
+            preds = logits.argmax(dim=-1)
+
+            correct += (preds == y).sum().item()
+            total += y.numel()
+
+            amb = amb.to(torch.bool)
+            simple_mask = ~amb
+            amb_mask = amb
+
+            simple_idx = simple_mask.nonzero(as_tuple=False).squeeze(-1)
+            amb_idx = amb_mask.nonzero(as_tuple=False).squeeze(-1)
+
+            if simple_idx.numel() > 0:
+                correct_simple += (preds[simple_idx] == y[simple_idx]).sum().item()
+                total_simple += simple_idx.numel()
+
+            if amb_idx.numel() > 0:
+                correct_amb += (preds[amb_idx] == y[amb_idx]).sum().item()
+                total_amb += amb_idx.numel()
+
+            if heldout_set is not None:
+                patterns = decode_query_pattern(x)
+                for b in range(y.size(0)):
+                    is_held = tuple(patterns[b].tolist()) in heldout_set
+                    if is_held:
+                        correct_held += int(preds[b] == y[b])
+                        total_held += 1
+                        if amb[b]:
+                            correct_held_amb += int(preds[b] == y[b])
+                            total_held_amb += 1
+                        else:
+                            correct_held_simple += int(preds[b] == y[b])
+                            total_held_simple += 1
+                    else:
+                        correct_seen += int(preds[b] == y[b])
+                        total_seen += 1
+                        if amb[b]:
+                            correct_seen_amb += int(preds[b] == y[b])
+                            total_seen_amb += 1
+                        else:
+                            correct_seen_simple += int(preds[b] == y[b])
+                            total_seen_simple += 1
+
+    def safe(num, den):
+        return num / den if den > 0 else None
+
+    overall = correct / total if total else 0.0
+    simple = correct_simple / total_simple if total_simple else 0.0
+    amb_acc = correct_amb / total_amb if total_amb else 0.0
+
+    metrics = {
+        "overall": overall,
+        "simple": simple,
+        "amb": amb_acc,
+        "seen_overall": safe(correct_seen, total_seen),
+        "seen_simple": safe(correct_seen_simple, total_seen_simple),
+        "seen_amb": safe(correct_seen_amb, total_seen_amb),
+        "heldout_overall": safe(correct_held, total_held),
+        "heldout_simple": safe(correct_held_simple, total_held_simple),
+        "heldout_amb": safe(correct_held_amb, total_held_amb),
+    }
+    return metrics
+
+
 # ---------------------------------------------------------------------
 # BINDING EVALUATION (query-slot attention → object slots)
 # ---------------------------------------------------------------------
@@ -845,22 +1012,74 @@ def run_hard_binding_experiment(cfg: USMConfig):
     random.seed(cfg.seed)
 
     print("=" * 60)
-    print("USM v1.3: HARD BINDING + 2-LAYER CTM + ADAPTIVE p + LATENT PRED")
+    print("USM v1.4: HARD BINDING + 2-LAYER CTM + ADAPTIVE p + LATENT PRED")
     print("         + BINDING LOSS (ANNEALED) + SLOT PROBES + PERM-INVARIANT")
+    print("         + GENERALIZATION SPLIT + JITTER")
     print("=" * 60)
     print("Device:", device)
 
+    heldout_patterns = None
+    if cfg.hb_split_mode == "heldout_pairs":
+        colors = HardBindingDataset.COLORS
+        rels = HardBindingDataset.RELS
+        color_to_idx = {c: i for i, c in enumerate(colors)}
+        rel_to_idx = {r: i for i, r in enumerate(rels)}
+
+        heldout_triples_names = [
+            ("red", "above", "blue"),
+            ("green", "left_of", "yellow"),
+            ("blue", "right_of", "red"),
+            ("yellow", "below", "green"),
+        ]
+
+        heldout_patterns = [
+            (color_to_idx[t], rel_to_idx[rel], color_to_idx[r])
+            for (t, rel, r) in heldout_triples_names
+        ]
+
+        all_patterns = list(itertools.product(range(len(colors)), range(len(rels)), range(len(colors))))
+        train_patterns = [p for p in all_patterns if p not in heldout_patterns]
+
+        print("\nGeneralization split (held-out query patterns):")
+        print("  Held-out triples:", heldout_triples_names)
+        print(f"  Train patterns: {len(train_patterns)} / {len(all_patterns)}")
+        print(f"  Held-out patterns: {len(heldout_patterns)} / {len(all_patterns)}")
+    else:
+        train_patterns = None
+
     # Datasets
-    train_ds = HardBindingDataset(
-        n_samples=cfg.hb_train_samples,
-        seed=cfg.seed,
-        permute_objects=cfg.hb_permute_objects_train,
-    )
-    eval_ds = HardBindingDataset(
-        n_samples=cfg.hb_eval_samples,
-        seed=cfg.seed + 1,
-        permute_objects=cfg.hb_permute_objects_eval,
-    )
+    if cfg.hb_split_mode == "iid":
+        train_ds = HardBindingDataset(
+            n_samples=cfg.hb_train_samples,
+            seed=cfg.seed,
+            permute_objects=cfg.hb_permute_train,
+            coord_jitter=cfg.hb_coord_jitter,
+            allowed_patterns=None,
+        )
+        eval_ds = HardBindingDataset(
+            n_samples=cfg.hb_eval_samples,
+            seed=cfg.seed + 1,
+            permute_objects=cfg.hb_permute_eval,
+            coord_jitter=cfg.hb_coord_jitter,
+            allowed_patterns=None,
+        )
+    elif cfg.hb_split_mode == "heldout_pairs":
+        train_ds = HardBindingDataset(
+            n_samples=cfg.hb_train_samples,
+            seed=cfg.seed,
+            permute_objects=cfg.hb_permute_train,
+            coord_jitter=cfg.hb_coord_jitter,
+            allowed_patterns=train_patterns,
+        )
+        eval_ds = HardBindingDataset(
+            n_samples=cfg.hb_eval_samples,
+            seed=cfg.seed + 1,
+            permute_objects=cfg.hb_permute_eval,
+            coord_jitter=cfg.hb_coord_jitter,
+            allowed_patterns=None,
+        )
+    else:
+        raise ValueError(f"Unknown hb_split_mode: {cfg.hb_split_mode}")
 
     amb_train, amb_train_n = ambig_fraction(train_ds)
     amb_eval, amb_eval_n = ambig_fraction(eval_ds)
@@ -1081,6 +1300,25 @@ def run_hard_binding_experiment(cfg: USMConfig):
     print(f"  CTM: {ctm_amb*100:4.1f}%")
     print(f"  Diff: {(ctm_amb-mlp_amb)*100:4.1f}%")
 
+    if cfg.hb_split_mode == "heldout_pairs" and heldout_patterns is not None:
+        print("\n" + "=" * 60)
+        print("GENERALIZATION SPLIT (HELD-OUT QUERY PATTERNS)")
+        print("=" * 60)
+
+        mlp_gen = evaluate_model_with_patterns(mlp, eval_loader, device, heldout_patterns)
+        ctm_gen = evaluate_model_with_patterns(ctm, eval_loader, device, heldout_patterns)
+
+        def fmt(x):
+            return "N/A" if x is None else f"{x*100:4.1f}%"
+
+        print("MLP:")
+        print(f"  Seen overall:     {fmt(mlp_gen['seen_overall'])}")
+        print(f"  Held-out overall: {fmt(mlp_gen['heldout_overall'])}")
+
+        print("\nCTM:")
+        print(f"  Seen overall:     {fmt(ctm_gen['seen_overall'])}")
+        print(f"  Held-out overall: {fmt(ctm_gen['heldout_overall'])}")
+
     # -----------------------------------------------------------------
     # BINDING PROBES
     # -----------------------------------------------------------------
@@ -1110,7 +1348,7 @@ def run_hard_binding_experiment(cfg: USMConfig):
     print(f"  Position MSE:   {probe_stats['pos_mse']:.4f}")
 
     print("\n" + "=" * 60)
-    print("v1.3 HARD BINDING COMPLETE")
+    print("v1.4 HARD BINDING COMPLETE")
     print("=" * 60)
 
 
