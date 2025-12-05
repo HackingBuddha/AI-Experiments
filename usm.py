@@ -692,6 +692,8 @@ def run_hard_binding_experiment(cfg: USMConfig):
                   f"Simple: {acc_simple*100:4.1f}% | "
                   f"Ambig: {acc_amb*100:4.1f}% | "
                   f"PredLoss: {last_pred_loss_val:.4f} | eff_p: {avg_eff_p:.2f}")
+            avg_eff_p_final = avg_eff_p
+            pred_loss_final = last_pred_loss_val
 
     # -----------------------------------------------------------------
     # FINAL CLASSIFICATION COMPARISON
