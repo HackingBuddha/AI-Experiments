@@ -345,13 +345,8 @@ class CTMHierModel(nn.Module):
         self.ctm_fast = CTMBlock(slot_dim, n_slots + 1, n_ticks=n_ticks_fast)
         self.ctm_slow = CTMBlock(slot_dim, n_slots + 1, n_ticks=n_ticks_slow)
 
-        # Classifier reads from query slot after slow layer
-        self.cls_head = nn.Sequential(
-            nn.LayerNorm(slot_dim),
-            nn.Linear(slot_dim, slot_dim),
-            nn.ReLU(),
-            nn.Linear(slot_dim, n_classes),
-        )
+        # Per-slot shape head (object-wise logits)
+        self.slot_shape_head = nn.Linear(slot_dim, n_classes)
 
     def encode_slots(self, x):
         """
@@ -378,19 +373,41 @@ class CTMHierModel(nn.Module):
           logits: [B, n_classes]
           pred_loss: scalar
           eff_p_mean: scalar
-          attn_last: [B, T, T] or None (attention in last CTM block)
+          attn_q2s: [B, n_slots] or None (query→object attention)
         """
         z = self.encode_slots(x)
         z, pred_loss_fast, eff_p_fast, _ = self.ctm_fast(z, return_attn=False)
-        z, pred_loss_slow, eff_p_slow, attn_last = self.ctm_slow(z, return_attn=return_attn)
+        # Always request attention from slow CTM to drive pointer-based readout
+        z, pred_loss_slow, eff_p_slow, attn_last = self.ctm_slow(z, return_attn=True)
 
         pred_loss = pred_loss_fast + pred_loss_slow
         eff_p_mean = 0.5 * (eff_p_fast + eff_p_slow)
+        slots = z[:, :self.n_slots, :]  # [B, n_slots, D]
 
-        # Read from query slot (last slot)
-        query_z = z[:, -1, :]
-        logits = self.cls_head(query_z)
-        return logits, pred_loss, eff_p_mean, attn_last
+        # Query→slot attention (from last slot row to the object slots)
+        if attn_last is not None:
+            q_idx = attn_last.shape[1] - 1
+            obj_attn = attn_last[:, q_idx, :self.n_slots]  # [B, n_slots]
+            attn_q2s = obj_attn / (obj_attn.sum(dim=-1, keepdim=True) + 1e-8)
+        else:
+            attn_q2s = None
+
+        # Per-slot logits
+        slot_logits = self.slot_shape_head(slots)  # [B, n_slots, n_classes]
+
+        # Pointer-style aggregation (log-space mix)
+        log_p_slots = F.log_softmax(slot_logits, dim=-1)
+        if attn_q2s is None:
+            # Fallback uniform attention if missing (should not happen in normal use)
+            attn_q2s = torch.full((slots.size(0), self.n_slots), 1.0 / self.n_slots, device=slots.device)
+        log_attn = torch.log(attn_q2s.clamp_min(1e-8)).unsqueeze(-1)
+        joint_log = log_p_slots + log_attn
+        final_logits = torch.logsumexp(joint_log, dim=1)
+
+        if not return_attn:
+            attn_q2s = None
+
+        return final_logits, pred_loss, eff_p_mean, attn_q2s
 
 
 # ---------------------------------------------------------------------
@@ -468,13 +485,12 @@ def evaluate_binding(ctm: CTMHierModel, loader, device, n_obj_slots: int = 4):
             amb = amb.to(torch.bool)
             cand_mask = cand_mask.to(device)  # [B,4]
 
-            logits, _, _, attn = ctm(x, return_attn=True)
-            if attn is None:
+            logits, _, _, attn_q2s = ctm(x, return_attn=True)
+            if attn_q2s is None:
                 continue
 
-            B, T, _ = attn.shape
-            q_idx = T - 1
-            obj_attn = attn[:, q_idx, :n_obj_slots]  # [B,4]
+            obj_attn = attn_q2s[:, :n_obj_slots]  # [B,4]
+            B = obj_attn.shape[0]
 
             # argmax binding
             max_idx = obj_attn.argmax(dim=-1)  # [B]
@@ -606,13 +622,16 @@ def main():
         running_eff_p = 0.0
         running_batches = 0
         last_pred_loss_val = 0.0
+        attn_debug_stats = None
 
         for x, y, amb, cand_mask in train_loader:
             x = x.to(device)
             y = y.to(device)
 
+            want_attn = attn_debug_stats is None and (epoch % 20 == 0)
+
             opt_ctm.zero_grad()
-            logits, pred_loss, eff_p_mean, _ = ctm(x)
+            logits, pred_loss, eff_p_mean, attn_q2s = ctm(x, return_attn=want_attn)
             loss_cls = ce(logits, y)
             loss = loss_cls + pred_loss_weight * pred_loss
             loss.backward()
@@ -622,9 +641,23 @@ def main():
             running_batches += 1
             last_pred_loss_val = pred_loss.detach().item()
 
+            if want_attn and attn_q2s is not None:
+                with torch.no_grad():
+                    attn_sum = attn_q2s.sum(dim=-1)
+                    attn_debug_stats = (
+                        float(attn_q2s.min()),
+                        float(attn_q2s.max()),
+                        float(attn_sum.mean()),
+                        bool(attn_q2s.requires_grad),
+                    )
+
         if epoch % 20 == 0:
             acc, acc_simple, acc_amb = evaluate_model(ctm, eval_loader, device)
             avg_eff_p = running_eff_p / max(1, running_batches)
+            if attn_debug_stats is not None:
+                attn_min, attn_max, attn_sum_mean, attn_req_grad = attn_debug_stats
+                print(f"  [AttnDbg] min={attn_min:.4f} max={attn_max:.4f} "
+                      f"mean_sum={attn_sum_mean:.4f} requires_grad={attn_req_grad}")
             print(f"Epoch {epoch:3d} | CTM | "
                   f"Eval: {acc*100:4.1f}% | "
                   f"Simple: {acc_simple*100:4.1f}% | "
