@@ -9,44 +9,13 @@ Original file is located at
 
 # @title
 # -*- coding: utf-8 -*-
-"""USM v1.4: Unified Science Machine – Hard Binding CTM Core
+"""
+USM v1.4 (clean): Hard Binding CTM core + perm-invariant + binding loss + slot probes
+and an optional tiny GridWorld + hypergraph + Active Inference stub.
 
-This file implements:
-
-- Hard Binding world:
-    * 4 objects on a 5×5 grid
-    * Queries of the form: "What shape is <color> <rel> of <color>?"
-    * Ambiguous cases (multiple valid candidates) explicitly flagged.
-    * Optionally permutation-invariant training via shuffling object order.
-
-- Models:
-    * MLP baseline.
-    * 2-layer CTM-ish slot model (fast + slow), with:
-        - LTC-like per-dim timescales.
-        - Adaptive p (sharpening) based on attention confidence.
-        - Latent prediction loss (z_t → z_{t+1}).
-        - Explicit query→object attention ("binding") head.
-        - Slot-level probes (color, shape, position).
-
-- Losses:
-    * Classification loss on answers.
-    * Latent prediction loss.
-    * Supervised binding loss (query attention vs cand_mask), with epoch-wise annealing.
-    * Slot-probe loss (decode per-object color/shape/position from slots).
-    * Optional attention entropy regularizer to discourage uniform attention.
-
-- Diagnostics:
-    * Separate accuracy on simple vs ambiguous scenes.
-    * Binding probe: attention argmax accuracy + mass on correct candidates.
-    * Slot probes: color/shape accuracy and position MSE.
-
-- Simple GridWorld + hypergraph + active inference agent kept as a second "world_type"
-  (lightweight, mainly to show how this CTM layer would plug into an agent loop).
-
-Everything is self-contained in one file / cell.
+Paste this as a single Colab cell and run.
 """
 
-import itertools
 import math
 import random
 from dataclasses import dataclass
@@ -64,41 +33,37 @@ from torch.utils.data import Dataset, DataLoader
 
 @dataclass
 class USMConfig:
-    # Which world to run
-    world_type: str = "hard_binding"  # "hard_binding" or "gridworld"
-
-    # General
+    # which "world" to run
+    world_type: str = "hard_binding"       # "hard_binding" or "gridworld"
     seed: int = 0
     device: str = "cuda"
 
-    # Hard-binding specific
+    # ----- Hard-binding task -----
     hb_train_samples: int = 8000
     hb_eval_samples: int = 4000
     hb_epochs: int = 100
     hb_batch_size: int = 256
     hb_lr: float = 1e-3
 
-    # Latent prediction loss
     hb_pred_loss_weight: float = 0.2
+    hb_probe_loss_weight: float = 0.5
 
-    # Generalization + robustness
-    hb_split_mode: str = "iid"          # "iid" or "heldout_pairs"
-    hb_coord_jitter: float = 0.0        # e.g. 0.02 for light jitter in continuous coords
-    hb_permute_train: bool = True       # whether to permute objects during training
-    hb_permute_eval: bool = True        # whether to permute objects during eval
+    # schedule for binding loss weight
+    hb_binding_loss_weight_base: float = 3.0
+    hb_binding_loss_epochs_warmup: int = 20   # start increasing after this
+    hb_binding_loss_epochs_full: int = 60     # fully on by here
 
-    # Binding supervision
-    hb_bind_loss_weight_max: float = 3.0
-    hb_bind_loss_warmup_epochs: int = 10
-    hb_bind_loss_full_epoch: int = 60
+    # data augmentation / invariances
+    hb_permute_objects: bool = True
+    hb_jitter_std_train: float = 0.05         # jitter coords in train only
+    hb_jitter_std_eval: float = 0.0           # usually 0
 
-    # Slot probe supervision
-    hb_probe_loss_weight: float = 0.3
+    # pattern-based generalisation:
+    # "iid" = random queries; "heldout_pairs" = hold out entire (tgt_color, rel, ref_color) patterns from train
+    hb_split_mode: str = "iid"                # or "heldout_pairs"
+    hb_num_heldout_patterns: int = 16         # number of held-out patterns if split_mode == heldout_pairs
 
-    # Attention entropy regularizer (encourages sharper bindings)
-    hb_attn_entropy_weight: float = 0.03
-
-    # GridWorld specific
+    # ----- GridWorld (toy) -----
     gw_size: int = 5
     gw_n_episodes: int = 200
     gw_max_steps: int = 40
@@ -113,8 +78,9 @@ def resolve_device(cfg: USMConfig) -> torch.device:
     return torch.device("cpu")
 
 
-# global device (updated in main)
+# global device handle (updated in main/run_X)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 # ---------------------------------------------------------------------
 # HARD BINDING DATASET
@@ -140,7 +106,7 @@ class HardBindingDataset(Dataset):
     Extra (for binding probes, no gradient):
       - cand_mask: [4] bool, which object indices satisfy the relation.
 
-    Encoding (per sample, after optional permutation of objects):
+    Encoding:
       - 4 objects × (color one-hot 4 + shape one-hot 4 + x + y) = 4 × 10 = 40
       - query = target_color (4) + relation (4) + ref_color (4) = 12
       - total input dim = 52
@@ -148,35 +114,42 @@ class HardBindingDataset(Dataset):
 
     COLORS = ["red", "green", "blue", "yellow"]
     SHAPES = ["ball", "cube", "cone", "star"]
-    RELS = ["left_of", "right_of", "above", "below"]
+    RELS   = ["left_of", "right_of", "above", "below"]
 
     def __init__(
         self,
         n_samples: int = 8000,
         seed: int = 0,
-        permute_objects: bool = False,
-        coord_jitter: float = 0.0,
         allowed_patterns: Optional[List[Tuple[int, int, int]]] = None,
+        permute_objects: bool = True,
+        coord_jitter_std: float = 0.0,
     ):
         """
-        allowed_patterns: optional list of (target_color_idx, rel_idx, ref_color_idx)
-                          triples that this dataset is allowed to sample.
-                          If None, all patterns are allowed (iid case).
+        allowed_patterns: optional list of (tgt_color_idx, rel_idx, ref_color_idx)
+          - if None: any pattern allowed
+          - if not None: only generate queries with pattern in this list
         """
-
+        super().__init__()
         self.n_samples = n_samples
         self.rng = random.Random(seed)
         self.permute_objects = permute_objects
-        self.coord_jitter = coord_jitter
+        self.coord_jitter_std = coord_jitter_std
         self.allowed_patterns = None
         if allowed_patterns is not None:
-            self.allowed_patterns = set(tuple(map(int, t)) for t in allowed_patterns)
+            # normalize to set of tuples of ints
+            self.allowed_patterns = {tuple(map(int, p)) for p in allowed_patterns}
 
-        # Generate canonical (non-permuted) samples; permutation is applied in __getitem__
-        # Each sample: dict with keys:
-        #   "objects": list of 4 dicts {color, shape, x, y}
-        #   "target_color", "ref_color", "rel", "y" (shape idx),
-        #   "amb" (bool), "cand_mask" (torch.bool[4])
+        # each sample is a dict:
+        # {
+        #   "objects": [ {color:str, shape:str, x:float, y:float} × 4 ],
+        #   "target_color": str,
+        #   "rel": str,
+        #   "ref_color": str,
+        #   "y": int (shape index),
+        #   "amb": bool,
+        #   "cand_mask": BoolTensor[4],
+        #   "pattern": (tgt_idx, rel_idx, ref_idx)
+        # }
         self.samples: List[Dict[str, Any]] = []
         self._generate()
 
@@ -202,10 +175,8 @@ class HardBindingDataset(Dataset):
         shapes = self.SHAPES
         rels = self.RELS
 
-        outer_attempts = 0
+        # sample until pattern is allowed (if restricted)
         while True:
-            outer_attempts += 1
-
             # 4 random objects
             objects = []
             for _ in range(4):
@@ -217,129 +188,135 @@ class HardBindingDataset(Dataset):
                 }
                 objects.append(obj)
 
-            # Query + label
-            attempts = 0
-            while True:
-                attempts += 1
-                ref_idx = self.rng.randrange(4)
-                ref = objects[ref_idx]
-                ref_color = ref["color"]
+            # choose query
+            ref_idx = self.rng.randrange(4)
+            ref = objects[ref_idx]
+            ref_color = ref["color"]
 
-                target_color = self.rng.choice(colors)
-                rel = self.rng.choice(rels)
+            target_color = self.rng.choice(colors)
+            rel = self.rng.choice(rels)
 
-                # Candidate targets: objects of target_color in relation to any object of ref_color
-                candidates = []
-                for i, obj in enumerate(objects):
-                    if obj["color"] != target_color:
-                        continue
-                    holds_any = False
-                    for j, ref2 in enumerate(objects):
-                        if ref2["color"] == ref_color and i != j:
-                            if self._relation_holds(obj, ref2, rel):
-                                holds_any = True
-                                break
-                    if holds_any:
-                        candidates.append(i)
-
-                if candidates:
-                    break
-                if attempts > 20:
-                    # Fallback: no candidate, treat as non-ambiguous random label
-                    candidates = [self.rng.randrange(4)]
-                    break
-
-            t_idx = colors.index(target_color)
-            r_idx = colors.index(ref_color)
+            tgt_idx = colors.index(target_color)
             rel_idx = rels.index(rel)
-            pattern = (t_idx, rel_idx, r_idx)
+            ref_idx_color = colors.index(ref_color)
+            pattern = (tgt_idx, rel_idx, ref_idx_color)
 
-            if self.allowed_patterns is not None and pattern not in self.allowed_patterns:
-                if outer_attempts < 50:
+            if (self.allowed_patterns is not None) and (pattern not in self.allowed_patterns):
+                # resample
+                continue
+
+            # Candidate targets: objects of target_color in relation to ANY ref of ref_color
+            candidates = []
+            for i, obj in enumerate(objects):
+                if obj["color"] != target_color:
                     continue
-                # Safety valve: accept after many attempts
+                holds_any = False
+                for j, ref2 in enumerate(objects):
+                    if ref2["color"] == ref_color and i != j:
+                        if self._relation_holds(obj, ref2, rel):
+                            holds_any = True
+                            break
+                if holds_any:
+                    candidates.append(i)
+
+            if not candidates:
+                # try again, but don't get stuck forever
+                # (if impossible, relax and create a "fake" candidate)
+                # In practice this rarely triggers.
+                if self.rng.random() < 0.05:
+                    candidates = [self.rng.randrange(4)]
+                else:
+                    continue
 
             ambiguous = len(candidates) > 1
+
             chosen_idx = self.rng.choice(candidates)
             answer_shape = objects[chosen_idx]["shape"]
-            y = shapes.index(answer_shape)
+            y_idx = shapes.index(answer_shape)
 
             cand_mask = torch.zeros(4, dtype=torch.bool)
             for idx in candidates:
                 cand_mask[idx] = True
 
-            return {
+            sample = {
                 "objects": objects,
                 "target_color": target_color,
-                "ref_color": ref_color,
                 "rel": rel,
-                "y": y,
+                "ref_color": ref_color,
+                "y": y_idx,
                 "amb": ambiguous,
                 "cand_mask": cand_mask,
+                "pattern": pattern,
             }
+            return sample
 
     def _generate(self):
         self.samples = [self._generate_one() for _ in range(self.n_samples)]
 
     def __len__(self):
-        return self.n_samples
+        return len(self.samples)
 
-    def _encode_sample(self, sample: Dict[str, Any]) -> Tuple[torch.Tensor, int, bool, torch.Tensor]:
+    def sample_humans(self, k: int = 3):
+        out = []
+        for i in range(min(k, len(self.samples))):
+            s = self.samples[i]
+            objects = s["objects"]
+            q = (s["target_color"], s["rel"], s["ref_color"])
+            answer = self.SHAPES[s["y"]]
+            amb = s["amb"]
+            out.append((objects, q, answer, amb))
+        return out
+
+    def __getitem__(self, idx: int):
+        """
+        Returns:
+          x: [52] float32
+          y: int
+          amb: bool
+          cand_mask: [4] bool
+        """
+        s = self.samples[idx]
+
+        # work on local copy of objects so we can permute/jitter without affecting stored sample
+        objects = [dict(o) for o in s["objects"]]
+        cand_mask = s["cand_mask"].clone()
         colors = self.COLORS
         shapes = self.SHAPES
         rels = self.RELS
 
-        objects = list(sample["objects"])  # shallow copy
-        cand_mask = sample["cand_mask"].clone()
-        y = sample["y"]
-        amb = sample["amb"]
-        target_color = sample["target_color"]
-        ref_color = sample["ref_color"]
-        rel = sample["rel"]
-
-        # Optional permutation of object order
+        # permutation invariance over object order
         if self.permute_objects:
             perm = torch.randperm(4)
-            objects = [objects[i] for i in perm.tolist()]
+            objects = [objects[int(i)] for i in perm]
             cand_mask = cand_mask[perm]
 
-        # Encode features
-        feat = []
-        jitter = self.coord_jitter
+        # coordinate jitter for train set
+        if self.coord_jitter_std > 0.0:
+            sigma = self.coord_jitter_std
+            for obj in objects:
+                obj["x"] = max(0.0, min(1.0, obj["x"] + self.rng.gauss(0.0, sigma)))
+                obj["y"] = max(0.0, min(1.0, obj["y"] + self.rng.gauss(0.0, sigma)))
+
+        # encode features
+        feat: List[float] = []
         for obj in objects:
-            x = obj["x"]
-            y = obj["y"]
-            if jitter > 0.0:
-                x = max(0.0, min(0.8, x + self.rng.uniform(-jitter, jitter)))
-                y = max(0.0, min(0.8, y + self.rng.uniform(-jitter, jitter)))
             color_oh = [1.0 if obj["color"] == c else 0.0 for c in colors]
             shape_oh = [1.0 if obj["shape"] == s else 0.0 for s in shapes]
-            feat.extend(color_oh + shape_oh + [x, y])
+            feat.extend(color_oh + shape_oh + [obj["x"], obj["y"]])
 
-        tgt_oh = [1.0 if target_color == c else 0.0 for c in colors]
+        tgt_color = s["target_color"]
+        rel = s["rel"]
+        ref_color = s["ref_color"]
+
+        tgt_oh = [1.0 if tgt_color == c else 0.0 for c in colors]
         rel_oh = [1.0 if rel == r else 0.0 for r in rels]
         ref_oh = [1.0 if ref_color == c else 0.0 for c in colors]
         feat.extend(tgt_oh + rel_oh + ref_oh)
 
         x = torch.tensor(feat, dtype=torch.float32)
+        y = int(s["y"])
+        amb = bool(s["amb"])
         return x, y, amb, cand_mask
-
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        x, y, amb, cand_mask = self._encode_sample(sample)
-        return x, y, amb, cand_mask
-
-    def sample_humans(self, k: int = 3):
-        """Return a few human-readable examples for logging (canonical order)."""
-        out = []
-        for i in range(min(k, len(self.samples))):
-            s = self.samples[i]
-            objects = s["objects"]
-            query = (s["target_color"], s["rel"], s["ref_color"])
-            answer = self.SHAPES[s["y"]]
-            amb = s["amb"]
-            out.append((objects, query, answer, amb))
-        return out
 
 
 def ambig_fraction(ds: HardBindingDataset) -> Tuple[float, int]:
@@ -348,7 +325,7 @@ def ambig_fraction(ds: HardBindingDataset) -> Tuple[float, int]:
 
 
 # ---------------------------------------------------------------------
-# MODELS: MLP BASELINE
+# MLP BASELINE
 # ---------------------------------------------------------------------
 
 class MLPBaseline(nn.Module):
@@ -367,12 +344,19 @@ class MLPBaseline(nn.Module):
 
 
 # ---------------------------------------------------------------------
-# CTM BLOCK (with LTC dynamics + adaptive p + latent prediction loss)
+# CTM BLOCK (with LTC-ish dynamics + adaptive p + latent prediction loss)
 # ---------------------------------------------------------------------
 
 class CTMBlock(nn.Module):
-    def __init__(self, dim, n_slots, n_ticks=3, dt=1.0,
-                 p_min=2.0, p_max=4.0):
+    def __init__(
+        self,
+        dim: int,
+        n_slots: int,
+        n_ticks: int = 3,
+        dt: float = 1.0,
+        p_min: float = 2.0,
+        p_max: float = 4.0,
+    ):
         super().__init__()
         self.dim = dim
         self.n_slots = n_slots
@@ -399,7 +383,7 @@ class CTMBlock(nn.Module):
             nn.Linear(dim, dim),
         )
 
-    def forward(self, z, return_attn: bool = False):
+    def forward(self, z: torch.Tensor, return_attn: bool = False):
         """
         z: [B, T, d]
 
@@ -419,13 +403,12 @@ class CTMBlock(nn.Module):
         for _ in range(self.n_ticks):
             h = self.pre_ln(self.in_proj(z))  # [B,T,d]
 
-            Q = self.q_proj(h)  # [B,T,d]
+            Q = self.q_proj(h)
             K = self.k_proj(h)
             V = self.v_proj(h)
 
-            # Base attention
             sim = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d)  # [B,T,T]
-            attn = torch.softmax(sim, dim=-1)  # [B,T,T]
+            attn = torch.softmax(sim, dim=-1)                           # [B,T,T]
 
             # Attention peakiness → sync confidence
             row_max = attn.max(dim=-1).values  # [B,T]
@@ -436,19 +419,18 @@ class CTMBlock(nn.Module):
             eff_p = self.p_min + (self.p_max - self.p_min) * conf  # [B]
             eff_ps.append(eff_p.detach())
 
-            # Adaptive p: sharpen or flatten the logits
             eff_p_exp = eff_p.view(B, 1, 1)
             sim_sharp = sim * eff_p_exp
             attn_sharp = torch.softmax(sim_sharp, dim=-1)  # [B,T,T]
-            last_attn = attn_sharp  # keep last tick's sharp attention
+            last_attn = attn_sharp
 
             context = torch.matmul(attn_sharp, V)  # [B,T,d]
             target = self.out_proj(context)        # [B,T,d]
 
-            # Latent prediction: z_pred ≈ z_next
-            z_pred = self.pred_net(z)  # [B,T,d]
+            # latent prediction
+            z_pred = self.pred_net(z)             # [B,T,d]
 
-            # LTC update: dz/dt = (target - z) / τ
+            # LTC update: dz/dt = (target - z) / tau
             dz = (target - z) / (tau + 1e-6)
             z_next = z + self.dt * dz
 
@@ -478,17 +460,28 @@ class CTMHierModel(nn.Module):
     - Total slots: 5 (4 objects + 1 query).
     - Layer 1: fast CTM (few ticks).
     - Layer 2: slow CTM (more ticks).
-    - Reads query→object attention from slow layer.
-    - Per-slot probes decode color/shape/position for interpretability.
+    - Reads out from query slot after slow layer (pointer to object slots).
+    - Adds probe heads to decode slot → (color, shape, position).
     """
 
-    def __init__(self, input_dim=52, slot_dim=32, n_slots=4, n_classes=4,
-                 n_ticks_fast=2, n_ticks_slow=3):
+    def __init__(
+        self,
+        input_dim: int = 52,
+        slot_dim: int = 32,
+        n_slots: int = 4,
+        n_classes: int = 4,
+        n_ticks_fast: int = 2,
+        n_ticks_slow: int = 3,
+        n_colors: int = 4,
+        n_shapes: int = 4,
+    ):
         super().__init__()
         self.input_dim = input_dim
         self.slot_dim = slot_dim
         self.n_slots = n_slots
         self.n_classes = n_classes
+        self.n_colors = n_colors
+        self.n_shapes = n_shapes
 
         # Each object chunk: color(4) + shape(4) + x + y = 10 dims
         self.obj_dim = 10
@@ -515,30 +508,35 @@ class CTMHierModel(nn.Module):
         # Per-slot shape head (object-wise logits)
         self.slot_shape_head = nn.Linear(slot_dim, n_classes)
 
-        # Slot probes: predict color, shape, position from each slot
-        self.probe_color_head = nn.Linear(slot_dim, 4)   # 4 colors
-        self.probe_shape_head = nn.Linear(slot_dim, 4)   # 4 shapes
-        self.probe_pos_head = nn.Linear(slot_dim, 2)     # (x,y)
+        # Probe heads for slot interpretability
+        self.probe_color_head = nn.Linear(slot_dim, n_colors)
+        self.probe_shape_head = nn.Linear(slot_dim, n_shapes)
+        self.probe_pos_head   = nn.Linear(slot_dim, 2)
 
-    def encode_slots(self, x):
+    def encode_slots(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: [B, 52]
         Returns:
-          z0:   [B, 5, slot_dim]
+          z0: [B, 5, slot_dim]
           slots 0..3: objects
           slot 4: query
         """
         B = x.shape[0]
-        obj_feats = x[:, :4 * self.obj_dim].view(B, 4, self.obj_dim)  # [B,4,10]
-        query_feats = x[:, 4 * self.obj_dim:]                          # [B,12]
+        obj_feats = x[:, :4 * self.obj_dim].view(B, 4, self.obj_dim)   # [B,4,10]
+        query_feats = x[:, 4 * self.obj_dim:]                           # [B,12]
 
-        obj_emb = self.slot_enc(obj_feats)                             # [B,4,D]
-        query_emb = self.query_enc(query_feats).unsqueeze(1)           # [B,1,D]
+        obj_emb = self.slot_enc(obj_feats)                              # [B,4,D]
+        query_emb = self.query_enc(query_feats).unsqueeze(1)            # [B,1,D]
 
-        z0 = torch.cat([obj_emb, query_emb], dim=1)                    # [B,5,D]
+        z0 = torch.cat([obj_emb, query_emb], dim=1)                     # [B,5,D]
         return z0
 
-    def forward(self, x, return_attn: bool = False, return_slots: bool = False):
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_attn: bool = False,
+        return_slots: bool = False,
+    ):
         """
         x: [B, 52]
         Returns:
@@ -550,13 +548,12 @@ class CTMHierModel(nn.Module):
         """
         z = self.encode_slots(x)
         z, pred_loss_fast, eff_p_fast, _ = self.ctm_fast(z, return_attn=False)
-
-        # Always request attention from slow CTM to drive pointer-based readout
         z, pred_loss_slow, eff_p_slow, attn_last = self.ctm_slow(z, return_attn=True)
 
         pred_loss = pred_loss_fast + pred_loss_slow
         eff_p_mean = 0.5 * (eff_p_fast + eff_p_slow)
-        slots = z[:, :self.n_slots, :]  # [B, n_slots, D]
+
+        slots = z[:, :self.n_slots, :]   # [B, n_slots, D]
 
         # Query→slot attention (from last slot row to the object slots)
         if attn_last is not None:
@@ -566,40 +563,39 @@ class CTMHierModel(nn.Module):
         else:
             attn_q2s = None
 
-        # Per-slot logits
+        # Per-slot logits over shapes
         slot_logits = self.slot_shape_head(slots)  # [B, n_slots, n_classes]
 
         # Pointer-style aggregation (log-space mix)
         log_p_slots = F.log_softmax(slot_logits, dim=-1)
         if attn_q2s is None:
-            # Fallback uniform attention if missing (should not happen in normal use)
             attn_q2s = torch.full(
                 (slots.size(0), self.n_slots),
                 1.0 / self.n_slots,
                 device=slots.device,
             )
-        log_attn = torch.log(attn_q2s.clamp_min(1e-8)).unsqueeze(-1)
+        log_attn = torch.log(attn_q2s.clamp_min(1e-8)).unsqueeze(-1)   # [B,n_slots,1]
         joint_log = log_p_slots + log_attn
-        final_logits = torch.logsumexp(joint_log, dim=1)  # [B, n_classes]
+        final_logits = torch.logsumexp(joint_log, dim=1)               # [B,n_classes]
 
         if not return_attn:
-            attn_out = None
+            attn_q2s_out = None
         else:
-            attn_out = attn_q2s
+            attn_q2s_out = attn_q2s
 
         if not return_slots:
             slots_out = None
         else:
             slots_out = slots
 
-        return final_logits, pred_loss, eff_p_mean, attn_out, slots_out
+        return final_logits, pred_loss, eff_p_mean, attn_q2s_out, slots_out
 
 
 # ---------------------------------------------------------------------
-# CLASSIFICATION EVALUATION
+# EVALUATION HELPERS
 # ---------------------------------------------------------------------
 
-def evaluate_model(model, loader, device):
+def evaluate_model(model: nn.Module, loader, device: torch.device):
     model.eval()
     correct = total = 0
     correct_simple = total_simple = 0
@@ -611,7 +607,7 @@ def evaluate_model(model, loader, device):
             y = y.to(device)
 
             if isinstance(model, CTMHierModel):
-                logits, _, _, _, _ = model(x, return_attn=False, return_slots=False)
+                logits, _, _, _, _ = model(x)
             else:
                 logits = model(x)
 
@@ -641,139 +637,12 @@ def evaluate_model(model, loader, device):
     return overall, simple, amb
 
 
-def decode_query_pattern(x_batch: torch.Tensor) -> torch.Tensor:
-    """
-    x_batch: [B, 52] input vectors (4*10 object features + 12 query features).
-
-    Returns:
-      patterns: [B, 3] integer tensor with (target_color_idx, rel_idx, ref_color_idx)
-    """
-    B = x_batch.size(0)
-    query = x_batch[:, 40:]  # [B,12]
-    tgt_logits = query[:, 0:4]
-    rel_logits = query[:, 4:8]
-    ref_logits = query[:, 8:12]
-
-    tgt_idx = tgt_logits.argmax(dim=-1)
-    rel_idx = rel_logits.argmax(dim=-1)
-    ref_idx = ref_logits.argmax(dim=-1)
-
-    return torch.stack([tgt_idx, rel_idx, ref_idx], dim=-1)  # [B,3]
-
-
-def evaluate_model_with_patterns(
-    model,
+def evaluate_binding(
+    ctm: CTMHierModel,
     loader,
-    device,
-    heldout_patterns: Optional[List[Tuple[int, int, int]]] = None,
+    device: torch.device,
+    n_obj_slots: int = 4,
 ):
-    """
-    Extended evaluation that splits accuracy into:
-      - overall / simple / ambiguous
-      - seen-pattern vs held-out-pattern subsets (if heldout_patterns is not None)
-
-    Returns:
-      metrics: dict with keys like:
-        "overall", "simple", "amb",
-        "seen_overall", "seen_simple", "seen_amb",
-        "heldout_overall", "heldout_simple", "heldout_amb"
-      (for the *_seen / *_heldout keys, values may be None if there are no samples)
-    """
-
-    model.eval()
-    correct = total = 0
-    correct_simple = total_simple = 0
-    correct_amb = total_amb = 0
-
-    correct_seen = total_seen = 0
-    correct_seen_simple = total_seen_simple = 0
-    correct_seen_amb = total_seen_amb = 0
-
-    correct_held = total_held = 0
-    correct_held_simple = total_held_simple = 0
-    correct_held_amb = total_held_amb = 0
-
-    heldout_set = set(tuple(p) for p in heldout_patterns) if heldout_patterns is not None else None
-
-    with torch.no_grad():
-        for x, y, amb, cand_mask in loader:
-            x = x.to(device)
-            y = y.to(device)
-
-            if isinstance(model, CTMHierModel):
-                logits, _, _, _, _ = model(x, return_attn=False, return_slots=False)
-            else:
-                logits = model(x)
-
-            preds = logits.argmax(dim=-1)
-
-            correct += (preds == y).sum().item()
-            total += y.numel()
-
-            amb = amb.to(torch.bool)
-            simple_mask = ~amb
-            amb_mask = amb
-
-            simple_idx = simple_mask.nonzero(as_tuple=False).squeeze(-1)
-            amb_idx = amb_mask.nonzero(as_tuple=False).squeeze(-1)
-
-            if simple_idx.numel() > 0:
-                correct_simple += (preds[simple_idx] == y[simple_idx]).sum().item()
-                total_simple += simple_idx.numel()
-
-            if amb_idx.numel() > 0:
-                correct_amb += (preds[amb_idx] == y[amb_idx]).sum().item()
-                total_amb += amb_idx.numel()
-
-            if heldout_set is not None:
-                patterns = decode_query_pattern(x)
-                for b in range(y.size(0)):
-                    is_held = tuple(patterns[b].tolist()) in heldout_set
-                    if is_held:
-                        correct_held += int(preds[b] == y[b])
-                        total_held += 1
-                        if amb[b]:
-                            correct_held_amb += int(preds[b] == y[b])
-                            total_held_amb += 1
-                        else:
-                            correct_held_simple += int(preds[b] == y[b])
-                            total_held_simple += 1
-                    else:
-                        correct_seen += int(preds[b] == y[b])
-                        total_seen += 1
-                        if amb[b]:
-                            correct_seen_amb += int(preds[b] == y[b])
-                            total_seen_amb += 1
-                        else:
-                            correct_seen_simple += int(preds[b] == y[b])
-                            total_seen_simple += 1
-
-    def safe(num, den):
-        return num / den if den > 0 else None
-
-    overall = correct / total if total else 0.0
-    simple = correct_simple / total_simple if total_simple else 0.0
-    amb_acc = correct_amb / total_amb if total_amb else 0.0
-
-    metrics = {
-        "overall": overall,
-        "simple": simple,
-        "amb": amb_acc,
-        "seen_overall": safe(correct_seen, total_seen),
-        "seen_simple": safe(correct_seen_simple, total_seen_simple),
-        "seen_amb": safe(correct_seen_amb, total_seen_amb),
-        "heldout_overall": safe(correct_held, total_held),
-        "heldout_simple": safe(correct_held_simple, total_held_simple),
-        "heldout_amb": safe(correct_held_amb, total_held_amb),
-    }
-    return metrics
-
-
-# ---------------------------------------------------------------------
-# BINDING EVALUATION (query-slot attention → object slots)
-# ---------------------------------------------------------------------
-
-def evaluate_binding(ctm: CTMHierModel, loader, device, n_obj_slots: int = 4):
     """
     Probes whether the query slot's attention actually binds to the correct objects.
 
@@ -818,7 +687,7 @@ def evaluate_binding(ctm: CTMHierModel, loader, device, n_obj_slots: int = 4):
             mass_sum += mass_on_correct.sum().item()
             mass_count += B
 
-            # split simple vs amb
+            # simple vs amb splits
             simple_mask = ~amb
             amb_mask = amb
 
@@ -839,10 +708,104 @@ def evaluate_binding(ctm: CTMHierModel, loader, device, n_obj_slots: int = 4):
     return overall, simple, amb, mean_mass
 
 
-def compute_binding_loss(attn_q2s: torch.Tensor,
-                         cand_mask: torch.Tensor,
-                         amb: torch.Tensor,
-                         eps: float = 1e-8) -> torch.Tensor:
+def decode_query_pattern(x_batch: torch.Tensor) -> torch.Tensor:
+    """
+    Decode (tgt_color_idx, rel_idx, ref_color_idx) triple from the query part of x.
+
+    x_batch: [B, 52] with last 12 dims = tgt_color (4) + rel (4) + ref_color (4)
+
+    Returns:
+      patterns: [B, 3] long tensor
+    """
+    B = x_batch.size(0)
+    obj_dim = 10
+    query = x_batch[:, 4 * obj_dim:]  # [B, 12]
+
+    tgt_oh = query[:, 0:4]
+    rel_oh = query[:, 4:8]
+    ref_oh = query[:, 8:12]
+
+    tgt_idx = tgt_oh.argmax(dim=-1)
+    rel_idx = rel_oh.argmax(dim=-1)
+    ref_idx = ref_oh.argmax(dim=-1)
+
+    patterns = torch.stack([tgt_idx, rel_idx, ref_idx], dim=-1).long()
+    return patterns
+
+
+def evaluate_model_with_patterns(
+    model: nn.Module,
+    loader,
+    device: torch.device,
+    heldout_patterns: Optional[List[Tuple[int, int, int]]] = None,
+):
+    """
+    Evaluate accuracy separately on:
+      - heldout query patterns (never seen in train) if provided
+      - "train" patterns (everything else)
+
+    heldout_patterns: list of (tgt_idx, rel_idx, ref_idx) triplets.
+    """
+    model.eval()
+    if heldout_patterns is None:
+        return {}
+
+    heldout_set = {tuple(map(int, p)) for p in heldout_patterns}
+
+    stats = {
+        "heldout_total": 0,
+        "heldout_correct": 0,
+        "train_total": 0,
+        "train_correct": 0,
+    }
+
+    with torch.no_grad():
+        for x, y, amb, cand_mask in loader:
+            x = x.to(device)
+            y = y.to(device)
+
+            if isinstance(model, CTMHierModel):
+                logits, _, _, _, _ = model(x)
+            else:
+                logits = model(x)
+
+            preds = logits.argmax(dim=-1)
+            patterns = decode_query_pattern(x)   # [B,3]
+
+            for i in range(y.size(0)):
+                patt = tuple(patterns[i].tolist())
+                is_held = patt in heldout_set
+                if is_held:
+                    stats["heldout_total"] += 1
+                    if preds[i] == y[i]:
+                        stats["heldout_correct"] += 1
+                else:
+                    stats["train_total"] += 1
+                    if preds[i] == y[i]:
+                        stats["train_correct"] += 1
+
+    def safe_div(a, b):
+        return a / b if b > 0 else 0.0
+
+    result = {
+        "heldout_acc": safe_div(stats["heldout_correct"], stats["heldout_total"]),
+        "train_acc": safe_div(stats["train_correct"], stats["train_total"]),
+        "heldout_count": stats["heldout_total"],
+        "train_count": stats["train_total"],
+    }
+    return result
+
+
+# ---------------------------------------------------------------------
+# LOSSES: binding + probe + schedules
+# ---------------------------------------------------------------------
+
+def compute_binding_loss(
+    attn_q2s: Optional[torch.Tensor],
+    cand_mask: torch.Tensor,
+    amb: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
     """
     Supervised binding loss for query→object attention.
 
@@ -850,6 +813,7 @@ def compute_binding_loss(attn_q2s: torch.Tensor,
     - Ambiguous scenes: soft target over all valid candidates.
     """
     if attn_q2s is None:
+        # no attention info; zero binding loss
         return torch.tensor(0.0, device=cand_mask.device)
 
     cand_mask = cand_mask.to(attn_q2s.device)
@@ -858,21 +822,19 @@ def compute_binding_loss(attn_q2s: torch.Tensor,
     simple_mask = ~amb
     loss_terms = []
 
-    # Simple: one-hot target
     if simple_mask.any():
         idx = simple_mask.nonzero(as_tuple=False).squeeze(-1)
-        attn_simple = attn_q2s[idx]          # [B_simple,4]
-        cand_simple = cand_mask[idx].float() # [B_simple,4]
+        attn_simple = attn_q2s[idx]           # [Ns,4]
+        cand_simple = cand_mask[idx].float()  # [Ns,4]
         target_idx = cand_simple.argmax(dim=-1)
         log_attn = (attn_simple + eps).log()
         ce_simple = F.nll_loss(log_attn, target_idx, reduction="mean")
         loss_terms.append(ce_simple)
 
-    # Ambiguous: soft target over valid candidates
     if amb.any():
         idx = amb.nonzero(as_tuple=False).squeeze(-1)
-        attn_amb = attn_q2s[idx]            # [B_amb,4]
-        cand_amb = cand_mask[idx].float()
+        attn_amb = attn_q2s[idx]             # [Na,4]
+        cand_amb = cand_mask[idx].float()    # [Na,4]
         cand_sum = cand_amb.sum(dim=-1, keepdim=True)
         valid = cand_sum.squeeze(-1) > 0
         if valid.any():
@@ -885,120 +847,80 @@ def compute_binding_loss(attn_q2s: torch.Tensor,
 
     if not loss_terms:
         return torch.tensor(0.0, device=attn_q2s.device)
-
     return torch.stack(loss_terms).mean()
 
 
-# ---------------------------------------------------------------------
-# SLOT PROBES (color/shape/position per slot)
-# ---------------------------------------------------------------------
-
-def compute_probe_loss(ctm: CTMHierModel,
-                       slots: torch.Tensor,
-                       x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
+def binding_weight_for_epoch(
+    epoch: int,
+    base: float,
+    warmup_epoch: int,
+    full_epoch: int,
+) -> float:
     """
-    Given final slots [B,4,D] and input x [B,52], decode:
-      - color index (0..3) per slot
-      - shape index (0..3) per slot
-      - position (x,y) per slot
+    Simple annealing schedule:
+      - 0 until warmup_epoch
+      - ramp linearly from 0 → base between warmup_epoch and full_epoch
+      - stay at base afterwards
+    """
+    if epoch <= warmup_epoch:
+        return 0.0
+    if epoch >= full_epoch:
+        return base
+    frac = (epoch - warmup_epoch) / max(1.0, float(full_epoch - warmup_epoch))
+    return base * frac
 
-    Targets are read directly from the first 40 dims of x (object chunks).
+
+def compute_probe_loss(ctm: CTMHierModel, slots: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """
+    Encourage each slot to retain object attributes:
+
+    From x we decode per-object:
+      - color idx ∈ [0..3]
+      - shape idx ∈ [0..3]
+      - position (x,y) ∈ [0,1]²
+
+    slots: [B, 4, D] (object slots only)
     """
     if slots is None:
-        return torch.tensor(0.0, device=x.device), {"color_acc": 0.0, "shape_acc": 0.0, "pos_mse": 0.0}
+        return torch.tensor(0.0, device=x.device)
 
     B = x.size(0)
-    obj_feats = x[:, :40].view(B, 4, 10)      # [B,4,10]
-    color_oh = obj_feats[:, :, :4]            # [B,4,4]
-    shape_oh = obj_feats[:, :, 4:8]           # [B,4,4]
-    pos_gt = obj_feats[:, :, 8:10]            # [B,4,2]
+    obj_dim = 10
+    obj_feats = x[:, :4 * obj_dim].view(B, 4, obj_dim)  # [B,4,10]
 
-    color_target = color_oh.argmax(dim=-1)    # [B,4]
-    shape_target = shape_oh.argmax(dim=-1)    # [B,4]
+    color_oh = obj_feats[:, :, 0:4]
+    shape_oh = obj_feats[:, :, 4:8]
+    pos = obj_feats[:, :, 8:10]
 
-    color_logits = ctm.probe_color_head(slots)   # [B,4,4]
-    shape_logits = ctm.probe_shape_head(slots)   # [B,4,4]
-    pos_pred = ctm.probe_pos_head(slots)         # [B,4,2]
+    color_idx = color_oh.argmax(dim=-1)  # [B,4]
+    shape_idx = shape_oh.argmax(dim=-1)  # [B,4]
 
-    # Flatten over slots for classification
+    color_logits = ctm.probe_color_head(slots)  # [B,4,n_colors]
+    shape_logits = ctm.probe_shape_head(slots)  # [B,4,n_shapes]
+    pos_pred = ctm.probe_pos_head(slots)        # [B,4,2]
+
+    # flatten B×4 → (B*4)
     color_loss = F.cross_entropy(
-        color_logits.view(-1, 4),
-        color_target.view(-1),
+        color_logits.view(-1, color_logits.size(-1)),
+        color_idx.view(-1),
     )
     shape_loss = F.cross_entropy(
-        shape_logits.view(-1, 4),
-        shape_target.view(-1),
+        shape_logits.view(-1, shape_logits.size(-1)),
+        shape_idx.view(-1),
     )
-    pos_loss = F.mse_loss(pos_pred, pos_gt)
+    pos_loss = F.mse_loss(pos_pred, pos)
 
-    total_loss = (color_loss + shape_loss + pos_loss) / 3.0
-
-    # Simple metrics (used only for logging at epoch-level)
-    with torch.no_grad():
-        color_pred = color_logits.argmax(dim=-1)
-        shape_pred = shape_logits.argmax(dim=-1)
-        color_acc = (color_pred == color_target).float().mean().item()
-        shape_acc = (shape_pred == shape_target).float().mean().item()
-        pos_mse = F.mse_loss(pos_pred, pos_gt).item()
-
-    stats = {
-        "color_acc": color_acc,
-        "shape_acc": shape_acc,
-        "pos_mse": pos_mse,
-    }
-    return total_loss, stats
+    # heuristic weighting: position is continuous; give it a slightly higher factor
+    loss = color_loss + shape_loss + 2.0 * pos_loss
+    return loss
 
 
-def evaluate_probes(ctm: CTMHierModel, loader, device) -> Dict[str, float]:
-    ctm.eval()
-    total_color_correct = 0
-    total_shape_correct = 0
-    total_slots = 0
-    pos_mse_sum = 0.0
-    pos_count = 0
-
-    with torch.no_grad():
-        for x, y, amb, cand_mask in loader:
-            x = x.to(device)
-            logits, _, _, _, slots = ctm(x, return_attn=False, return_slots=True)
-            if slots is None:
-                continue
-
-            B = x.size(0)
-            obj_feats = x[:, :40].view(B, 4, 10)
-            color_oh = obj_feats[:, :, :4]
-            shape_oh = obj_feats[:, :, 4:8]
-            pos_gt = obj_feats[:, :, 8:10]
-
-            color_target = color_oh.argmax(dim=-1)   # [B,4]
-            shape_target = shape_oh.argmax(dim=-1)   # [B,4]
-
-            color_logits = ctm.probe_color_head(slots)
-            shape_logits = ctm.probe_shape_head(slots)
-            pos_pred = ctm.probe_pos_head(slots)
-
-            color_pred = color_logits.argmax(dim=-1)
-            shape_pred = shape_logits.argmax(dim=-1)
-
-            total_color_correct += (color_pred == color_target).sum().item()
-            total_shape_correct += (shape_pred == shape_target).sum().item()
-            total_slots += B * 4
-
-            pos_mse_sum += F.mse_loss(pos_pred, pos_gt, reduction="sum").item()
-            pos_count += B * 4 * 2
-
-    if total_slots == 0:
-        return {"color_acc": 0.0, "shape_acc": 0.0, "pos_mse": 0.0}
-
-    color_acc = total_color_correct / total_slots
-    shape_acc = total_shape_correct / total_slots
-    pos_mse = pos_mse_sum / pos_count
-
-    return {
-        "color_acc": color_acc,
-        "shape_acc": shape_acc,
-        "pos_mse": pos_mse,
-    }
+def attention_entropy(attn_q2s: Optional[torch.Tensor]) -> float:
+    if attn_q2s is None:
+        return 0.0
+    p = attn_q2s.clamp_min(1e-8)
+    ent = -(p * p.log()).sum(dim=-1).mean().item()
+    return float(ent)
 
 
 # ---------------------------------------------------------------------
@@ -1014,72 +936,52 @@ def run_hard_binding_experiment(cfg: USMConfig):
     print("=" * 60)
     print("USM v1.4: HARD BINDING + 2-LAYER CTM + ADAPTIVE p + LATENT PRED")
     print("         + BINDING LOSS (ANNEALED) + SLOT PROBES + PERM-INVARIANT")
-    print("         + GENERALIZATION SPLIT + JITTER")
     print("=" * 60)
     print("Device:", device)
 
+    # set up pattern split (for generalization)
     heldout_patterns = None
+    train_patterns = None
+
     if cfg.hb_split_mode == "heldout_pairs":
-        colors = HardBindingDataset.COLORS
-        rels = HardBindingDataset.RELS
-        color_to_idx = {c: i for i, c in enumerate(colors)}
-        rel_to_idx = {r: i for i, r in enumerate(rels)}
-
-        heldout_triples_names = [
-            ("red", "above", "blue"),
-            ("green", "left_of", "yellow"),
-            ("blue", "right_of", "red"),
-            ("yellow", "below", "green"),
-        ]
-
-        heldout_patterns = [
-            (color_to_idx[t], rel_to_idx[rel], color_to_idx[r])
-            for (t, rel, r) in heldout_triples_names
-        ]
-
-        all_patterns = list(itertools.product(range(len(colors)), range(len(rels)), range(len(colors))))
-        train_patterns = [p for p in all_patterns if p not in heldout_patterns]
-
-        print("\nGeneralization split (held-out query patterns):")
-        print("  Held-out triples:", heldout_triples_names)
-        print(f"  Train patterns: {len(train_patterns)} / {len(all_patterns)}")
-        print(f"  Held-out patterns: {len(heldout_patterns)} / {len(all_patterns)}")
+        colors = list(range(len(HardBindingDataset.COLORS)))
+        rels = list(range(len(HardBindingDataset.RELS)))
+        all_patterns = [(c_t, r, c_ref) for c_t in colors for r in rels for c_ref in colors]
+        random.shuffle(all_patterns)
+        k = min(cfg.hb_num_heldout_patterns, len(all_patterns))
+        heldout_patterns = all_patterns[:k]
+        train_patterns = all_patterns[k:]
+        print(f"[Split] Using HELD-OUT patterns for generalization ({k} patterns)")
+    elif cfg.hb_split_mode == "iid":
+        print("[Split] Using IID query patterns (no held-out patterns)")
     else:
-        train_patterns = None
+        raise ValueError(f"Unknown hb_split_mode: {cfg.hb_split_mode}")
 
-    # Datasets
+    # datasets
     if cfg.hb_split_mode == "iid":
         train_ds = HardBindingDataset(
             n_samples=cfg.hb_train_samples,
             seed=cfg.seed,
-            permute_objects=cfg.hb_permute_train,
-            coord_jitter=cfg.hb_coord_jitter,
             allowed_patterns=None,
+            permute_objects=cfg.hb_permute_objects,
+            coord_jitter_std=cfg.hb_jitter_std_train,
         )
-        eval_ds = HardBindingDataset(
-            n_samples=cfg.hb_eval_samples,
-            seed=cfg.seed + 1,
-            permute_objects=cfg.hb_permute_eval,
-            coord_jitter=cfg.hb_coord_jitter,
-            allowed_patterns=None,
-        )
-    elif cfg.hb_split_mode == "heldout_pairs":
+    else:
         train_ds = HardBindingDataset(
             n_samples=cfg.hb_train_samples,
             seed=cfg.seed,
-            permute_objects=cfg.hb_permute_train,
-            coord_jitter=cfg.hb_coord_jitter,
             allowed_patterns=train_patterns,
+            permute_objects=cfg.hb_permute_objects,
+            coord_jitter_std=cfg.hb_jitter_std_train,
         )
-        eval_ds = HardBindingDataset(
-            n_samples=cfg.hb_eval_samples,
-            seed=cfg.seed + 1,
-            permute_objects=cfg.hb_permute_eval,
-            coord_jitter=cfg.hb_coord_jitter,
-            allowed_patterns=None,
-        )
-    else:
-        raise ValueError(f"Unknown hb_split_mode: {cfg.hb_split_mode}")
+
+    eval_ds = HardBindingDataset(
+        n_samples=cfg.hb_eval_samples,
+        seed=cfg.seed + 1,
+        allowed_patterns=None,  # full pattern support in eval
+        permute_objects=cfg.hb_permute_objects,
+        coord_jitter_std=cfg.hb_jitter_std_eval,
+    )
 
     amb_train, amb_train_n = ambig_fraction(train_ds)
     amb_eval, amb_eval_n = ambig_fraction(eval_ds)
@@ -1092,7 +994,7 @@ def run_hard_binding_experiment(cfg: USMConfig):
     print(f"  Ambiguous fraction (train): {amb_train*100:.1f}% ({amb_train_n} cases)")
     print(f"  Ambiguous fraction (eval):  {amb_eval*100:.1f}% ({amb_eval_n} cases)")
 
-    # Show a few examples (canonical order)
+    # show a few examples
     print("\n--- Examples ---\n")
     for objects, query, answer, amb in train_ds.sample_humans(3):
         qs = f"What shape is {query[0]} {query[1]} of {query[2]}?"
@@ -1104,9 +1006,7 @@ def run_hard_binding_experiment(cfg: USMConfig):
     train_loader = DataLoader(train_ds, batch_size=cfg.hb_batch_size, shuffle=True)
     eval_loader = DataLoader(eval_ds, batch_size=cfg.hb_batch_size, shuffle=False)
 
-    # -----------------------------------------------------------------
-    # MODELS
-    # -----------------------------------------------------------------
+    # ---- Models ----
     mlp = MLPBaseline(input_dim=52, hidden=64, n_classes=4).to(device)
     ctm = CTMHierModel(
         input_dim=52,
@@ -1115,6 +1015,8 @@ def run_hard_binding_experiment(cfg: USMConfig):
         n_classes=4,
         n_ticks_fast=2,
         n_ticks_slow=3,
+        n_colors=len(HardBindingDataset.COLORS),
+        n_shapes=len(HardBindingDataset.SHAPES),
     ).to(device)
 
     n_params_ctm = sum(p.numel() for p in ctm.parameters())
@@ -1124,11 +1026,9 @@ def run_hard_binding_experiment(cfg: USMConfig):
     print("----------------------------------------")
     print(f"CTM: {n_params_ctm:,} params")
     print(f"MLP: {n_params_mlp:,} params")
-    print(f"Ratio: {n_params_ctm / max(1,n_params_mlp):.2f}x")
+    print(f"Ratio: {n_params_ctm / max(1, n_params_mlp):.2f}x")
 
-    # -----------------------------------------------------------------
-    # TRAIN MLP BASELINE
-    # -----------------------------------------------------------------
+    # ---- Train MLP baseline ----
     print("\n----------------------------------------")
     print(f"TRAINING MLP ({cfg.hb_epochs} epochs)")
     print("----------------------------------------")
@@ -1148,38 +1048,24 @@ def run_hard_binding_experiment(cfg: USMConfig):
 
         if epoch % 20 == 0 or epoch == cfg.hb_epochs:
             acc, acc_simple, acc_amb = evaluate_model(mlp, eval_loader, device)
-            print(f"Epoch {epoch:3d} | MLP | "
-                  f"Eval: {acc*100:4.1f}% | "
-                  f"Simple: {acc_simple*100:4.1f}% | "
-                  f"Ambig: {acc_amb*100:4.1f}%")
+            print(
+                f"Epoch {epoch:3d} | MLP | "
+                f"Eval: {acc*100:4.1f}% | "
+                f"Simple: {acc_simple*100:4.1f}% | "
+                f"Ambig: {acc_amb*100:4.1f}%"
+            )
 
-    # -----------------------------------------------------------------
-    # TRAIN CTM (with adaptive p + latent prediction + binding + probes)
-    # -----------------------------------------------------------------
+    # ---- Train CTM ----
     print("\n----------------------------------------")
     print(
-        "TRAINING CTM "
-        f"({cfg.hb_epochs} epochs) + Adaptive p + Latent Pred Loss "
-        "+ Binding Loss (annealed) + Slot Probes"
+        f"TRAINING CTM ({cfg.hb_epochs} epochs) + Adaptive p + Latent Pred Loss "
+        f"+ Binding Loss (annealed) + Slot Probes"
     )
     print("----------------------------------------")
 
     opt_ctm = torch.optim.AdamW(ctm.parameters(), lr=cfg.hb_lr)
     pred_loss_weight = cfg.hb_pred_loss_weight
-
-    def binding_weight_for_epoch(ep: int) -> float:
-        if ep <= cfg.hb_bind_loss_warmup_epochs:
-            return 0.0
-        if ep >= cfg.hb_bind_loss_full_epoch:
-            return cfg.hb_bind_loss_weight_max
-        # Linear ramp
-        t = (ep - cfg.hb_bind_loss_warmup_epochs) / max(
-            1,
-            (cfg.hb_bind_loss_full_epoch - cfg.hb_bind_loss_warmup_epochs),
-        )
-        return cfg.hb_bind_loss_weight_max * max(0.0, min(1.0, t))
-
-    last_probe_stats = {"color_acc": 0.0, "shape_acc": 0.0, "pos_mse": 0.0}
+    probe_loss_weight = cfg.hb_probe_loss_weight
 
     for epoch in range(1, cfg.hb_epochs + 1):
         ctm.train()
@@ -1188,10 +1074,15 @@ def run_hard_binding_experiment(cfg: USMConfig):
         last_pred_loss_val = 0.0
         last_bind_loss_val = 0.0
         last_probe_loss_val = 0.0
-        last_attn_entropy = 0.0
         attn_debug_stats = None
+        attn_ent_val = 0.0
 
-        bind_w = binding_weight_for_epoch(epoch)
+        bind_w = binding_weight_for_epoch(
+            epoch,
+            base=cfg.hb_binding_loss_weight_base,
+            warmup_epoch=cfg.hb_binding_loss_epochs_warmup,
+            full_epoch=cfg.hb_binding_loss_epochs_full,
+        )
 
         for x, y, amb, cand_mask in train_loader:
             x = x.to(device)
@@ -1199,33 +1090,26 @@ def run_hard_binding_experiment(cfg: USMConfig):
             amb = amb.to(device)
             cand_mask = cand_mask.to(device)
 
+            want_attn = attn_debug_stats is None and (epoch % 20 == 0)
+
             opt_ctm.zero_grad()
-            # Always get attention + slots for losses
             logits, pred_loss, eff_p_mean, attn_q2s, slots = ctm(
                 x,
-                return_attn=True,
+                return_attn=want_attn,
                 return_slots=True,
             )
             loss_cls = ce(logits, y)
-
             bind_loss = compute_binding_loss(attn_q2s, cand_mask, amb)
-            probe_loss, probe_stats = compute_probe_loss(ctm, slots, x)
+            probe_loss = compute_probe_loss(ctm, slots, x)
 
-            # Attention entropy (per sample, averaged)
-            if attn_q2s is not None:
-                attn_entropy = -(attn_q2s.clamp_min(1e-8) *
-                                 attn_q2s.clamp_min(1e-8).log()).sum(dim=-1).mean()
-            else:
-                attn_entropy = torch.tensor(0.0, device=x.device)
-
-            total_loss = (
+            loss = (
                 loss_cls
                 + pred_loss_weight * pred_loss
                 + bind_w * bind_loss
-                + cfg.hb_probe_loss_weight * probe_loss
-                + cfg.hb_attn_entropy_weight * attn_entropy
+                + probe_loss_weight * probe_loss
             )
-            total_loss.backward()
+
+            loss.backward()
             opt_ctm.step()
 
             running_eff_p += float(eff_p_mean)
@@ -1233,10 +1117,9 @@ def run_hard_binding_experiment(cfg: USMConfig):
             last_pred_loss_val = pred_loss.detach().item()
             last_bind_loss_val = bind_loss.detach().item()
             last_probe_loss_val = probe_loss.detach().item()
-            last_attn_entropy = attn_entropy.detach().item()
-            last_probe_stats = probe_stats
+            attn_ent_val = attention_entropy(attn_q2s)
 
-            if attn_debug_stats is None and attn_q2s is not None:
+            if want_attn and attn_q2s is not None:
                 with torch.no_grad():
                     attn_sum = attn_q2s.sum(dim=-1)
                     attn_debug_stats = (
@@ -1251,8 +1134,10 @@ def run_hard_binding_experiment(cfg: USMConfig):
             avg_eff_p = running_eff_p / max(1, running_batches)
             if attn_debug_stats is not None:
                 attn_min, attn_max, attn_sum_mean, attn_req_grad = attn_debug_stats
-                print(f"  [AttnDbg] min={attn_min:.4f} max={attn_max:.4f} "
-                      f"mean_sum={attn_sum_mean:.4f} requires_grad={attn_req_grad}")
+                print(
+                    f"  [AttnDbg] min={attn_min:.4f} max={attn_max:.4f} "
+                    f"mean_sum={attn_sum_mean:.4f} requires_grad={attn_req_grad}"
+                )
             print(
                 f"Epoch {epoch:3d} | CTM | "
                 f"Eval: {acc*100:4.1f}% | "
@@ -1262,14 +1147,11 @@ def run_hard_binding_experiment(cfg: USMConfig):
                 f"BindLoss: {last_bind_loss_val:.4f} | "
                 f"ProbeLoss: {last_probe_loss_val:.4f} | "
                 f"BindW: {bind_w:.3f} | "
-                f"AttnEnt: {last_attn_entropy:.3f} | "
-                f"eff_p: {avg_eff_p:.2f}")
-            avg_eff_p_final = avg_eff_p
-            pred_loss_final = last_pred_loss_val
+                f"AttnEnt: {attn_ent_val:.3f} | "
+                f"eff_p: {avg_eff_p:.2f}"
+            )
 
-    # -----------------------------------------------------------------
-    # FINAL CLASSIFICATION COMPARISON
-    # -----------------------------------------------------------------
+    # ---- Final classification comparison ----
     print("\n" + "=" * 60)
     print("DETAILED EVALUATION (CLASSIFICATION)")
     print("=" * 60)
@@ -1300,52 +1182,97 @@ def run_hard_binding_experiment(cfg: USMConfig):
     print(f"  CTM: {ctm_amb*100:4.1f}%")
     print(f"  Diff: {(ctm_amb-mlp_amb)*100:4.1f}%")
 
-    if cfg.hb_split_mode == "heldout_pairs" and heldout_patterns is not None:
-        print("\n" + "=" * 60)
-        print("GENERALIZATION SPLIT (HELD-OUT QUERY PATTERNS)")
-        print("=" * 60)
-
-        mlp_gen = evaluate_model_with_patterns(mlp, eval_loader, device, heldout_patterns)
-        ctm_gen = evaluate_model_with_patterns(ctm, eval_loader, device, heldout_patterns)
-
-        def fmt(x):
-            return "N/A" if x is None else f"{x*100:4.1f}%"
-
-        print("MLP:")
-        print(f"  Seen overall:     {fmt(mlp_gen['seen_overall'])}")
-        print(f"  Held-out overall: {fmt(mlp_gen['heldout_overall'])}")
-
-        print("\nCTM:")
-        print(f"  Seen overall:     {fmt(ctm_gen['seen_overall'])}")
-        print(f"  Held-out overall: {fmt(ctm_gen['heldout_overall'])}")
-
-    # -----------------------------------------------------------------
-    # BINDING PROBES
-    # -----------------------------------------------------------------
+    # ---- Binding probes ----
     print("\n" + "=" * 60)
     print("BINDING PROBES (QUERY ATTENTION → OBJECT SLOTS)")
     print("=" * 60)
 
     bind_overall, bind_simple, bind_amb, mass_mean = evaluate_binding(
-        ctm,
-        eval_loader,
-        device,
-        n_obj_slots=4,
+        ctm, eval_loader, device, n_obj_slots=4
     )
-    print(f"\nBinding argmax accuracy (query attention to correct object):")
+    print("\nBinding argmax accuracy (query attention to correct object):")
     print(f"  Overall: {bind_overall*100:4.1f}%")
     print(f"  Simple:  {bind_simple*100:4.1f}%")
     print(f"  Ambig:   {bind_amb*100:4.1f}%")
     print(f"\nMean attention mass on correct candidate(s): {mass_mean*100:4.1f}%")
 
-    # -----------------------------------------------------------------
-    # SLOT PROBE METRICS
-    # -----------------------------------------------------------------
+    # ---- Slot probe metrics ----
     print("\nPROBE METRICS (Slots → object attributes):")
-    probe_stats = evaluate_probes(ctm, eval_loader, device)
-    print(f"  Color accuracy: {probe_stats['color_acc']*100:4.1f}%")
-    print(f"  Shape accuracy: {probe_stats['shape_acc']*100:4.1f}%")
-    print(f"  Position MSE:   {probe_stats['pos_mse']:.4f}")
+    ctm.eval()
+    color_correct = color_total = 0
+    shape_correct = shape_total = 0
+    pos_se_sum = pos_count = 0.0
+
+    with torch.no_grad():
+        for x, y, amb, cand_mask in eval_loader:
+            x = x.to(device)
+            logits, _, _, _, slots = ctm(x, return_attn=False, return_slots=True)
+            if slots is None:
+                continue
+
+            B = x.size(0)
+            obj_dim = 10
+            obj_feats = x[:, :4 * obj_dim].view(B, 4, obj_dim)
+            color_oh = obj_feats[:, :, 0:4]
+            shape_oh = obj_feats[:, :, 4:8]
+            pos = obj_feats[:, :, 8:10]
+
+            color_idx = color_oh.argmax(dim=-1)  # [B,4]
+            shape_idx = shape_oh.argmax(dim=-1)  # [B,4]
+
+            color_logits = ctm.probe_color_head(slots)  # [B,4,n_colors]
+            shape_logits = ctm.probe_shape_head(slots)  # [B,4,n_shapes]
+            pos_pred = ctm.probe_pos_head(slots)        # [B,4,2]
+
+            color_pred = color_logits.argmax(dim=-1)
+            shape_pred = shape_logits.argmax(dim=-1)
+
+            color_correct += (color_pred == color_idx).sum().item()
+            color_total += color_idx.numel()
+
+            shape_correct += (shape_pred == shape_idx).sum().item()
+            shape_total += shape_idx.numel()
+
+            se = (pos_pred - pos) ** 2
+            pos_se_sum += se.sum().item()
+            pos_count += se.numel()
+
+    color_acc = color_correct / max(1, color_total)
+    shape_acc = shape_correct / max(1, shape_total)
+    pos_mse = pos_se_sum / max(1, pos_count)
+
+    print(f"  Color accuracy: {color_acc*100:4.1f}%")
+    print(f"  Shape accuracy: {shape_acc*100:4.1f}%")
+    print(f"  Position MSE:   {pos_mse:.4f}")
+
+    # ---- Held-out pattern generalisation (if configured) ----
+    if heldout_patterns is not None:
+        print("\n" + "=" * 60)
+        print("PATTERN-LEVEL GENERALISATION (HELD-OUT QUERY PATTERNS)")
+        print("=" * 60)
+
+        mlp_gen = evaluate_model_with_patterns(mlp, eval_loader, device, heldout_patterns)
+        ctm_gen = evaluate_model_with_patterns(ctm, eval_loader, device, heldout_patterns)
+
+        print("\nMLP pattern split:")
+        print(
+            f"  Train patterns: {mlp_gen['train_acc']*100:4.1f}% "
+            f"over {mlp_gen['train_count']} examples"
+        )
+        print(
+            f"  Held-out patterns: {mlp_gen['heldout_acc']*100:4.1f}% "
+            f"over {mlp_gen['heldout_count']} examples"
+        )
+
+        print("\nCTM pattern split:")
+        print(
+            f"  Train patterns: {ctm_gen['train_acc']*100:4.1f}% "
+            f"over {ctm_gen['train_count']} examples"
+        )
+        print(
+            f"  Held-out patterns: {ctm_gen['heldout_acc']*100:4.1f}% "
+            f"over {ctm_gen['heldout_count']} examples"
+        )
 
     print("\n" + "=" * 60)
     print("v1.4 HARD BINDING COMPLETE")
@@ -1353,7 +1280,7 @@ def run_hard_binding_experiment(cfg: USMConfig):
 
 
 # ---------------------------------------------------------------------
-# SIMPLE GRIDWORLD
+# SIMPLE GRIDWORLD (optional toy)
 # ---------------------------------------------------------------------
 
 class GridWorld:
@@ -1408,33 +1335,24 @@ class GridWorld:
         return self._get_obs(), reward, done
 
 
-# ---------------------------------------------------------------------
-# ETERNAL HYPERGRAPH (minimal)
-# ---------------------------------------------------------------------
+# minimal hypergraph + active inference agent, as in previous versions
 
 class NodeType(Enum):
     EXPERIENCE = "experience"
     GOAL = "goal"
 
 
-@dataclass
 class HyperNode:
-    id: str
-    node_type: NodeType
-    embedding: torch.Tensor  # [D] on CPU
-    data: Dict[str, Any]
-    reward: float = 0.0
-    created_at: int = 0
+    def __init__(self, id: str, node_type: NodeType, embedding: torch.Tensor, data: Dict[str, Any], reward: float, created_at: int):
+        self.id = id
+        self.node_type = node_type
+        self.embedding = embedding
+        self.data = data
+        self.reward = reward
+        self.created_at = created_at
 
 
 class EternalHypergraph:
-    """
-    Tiny experience-based world model:
-    - Stores (z_t, a, z_{t+1}, r) as EXPERIENCE nodes.
-    - Supports simple similarity-based retrieval over embeddings.
-    - Tracks a global step counter.
-    """
-
     def __init__(self, embedding_dim: int, max_nodes: int = 5000):
         self.embedding_dim = embedding_dim
         self.max_nodes = max_nodes
@@ -1442,8 +1360,7 @@ class EternalHypergraph:
         self.experience_ids: List[str] = []
         self.step = 0
 
-    def add_experience(self, z: torch.Tensor, action: int,
-                       z_next: torch.Tensor, reward: float) -> str:
+    def add_experience(self, z: torch.Tensor, action: int, z_next: torch.Tensor, reward: float) -> str:
         self.step += 1
         node_id = f"exp_{len(self.nodes)}_{self.step}"
         emb = z.detach().cpu().clone()
@@ -1466,17 +1383,6 @@ class EternalHypergraph:
             self.nodes.pop(old_id, None)
         return node_id
 
-    def retrieve_similar(self, z: torch.Tensor, k: int = 16) -> List[HyperNode]:
-        if not self.experience_ids:
-            return []
-        ids = list(self.experience_ids)
-        embs = torch.stack([self.nodes[i].embedding for i in ids], dim=0).to(z.device)
-        z_norm = F.normalize(z.unsqueeze(0), dim=-1)
-        embs_norm = F.normalize(embs, dim=-1)
-        sims = torch.matmul(embs_norm, z_norm.transpose(0, 1)).squeeze(-1)  # [N]
-        topk = torch.topk(sims, k=min(k, sims.numel()))
-        return [self.nodes[ids[idx]] for idx in topk.indices.tolist()]
-
     def get_action_values(self, z: torch.Tensor, n_actions: int) -> torch.Tensor:
         if not self.experience_ids:
             return torch.zeros(n_actions, device=z.device)
@@ -1495,32 +1401,16 @@ class EternalHypergraph:
         return q_vals / counts
 
 
-# ---------------------------------------------------------------------
-# ACTIVE INFERENCE AGENT (minimal)
-# ---------------------------------------------------------------------
-
 class ActiveInferenceAgent(nn.Module):
-    """
-    Lightweight Active Inference agent:
-    - Latent belief z ∈ R^D comes from a CTM encoder.
-    - Has a small neural transition model f(z, a).
-    - Uses EternalHypergraph as a memory-based world model.
-    - Selects actions by minimizing a simple free energy objective (here: just
-      favor actions with high memory-based value).
-    """
-
     def __init__(self, latent_dim: int, n_actions: int):
         super().__init__()
         self.latent_dim = latent_dim
         self.n_actions = n_actions
-
         self.transition = nn.Sequential(
             nn.Linear(latent_dim + n_actions, latent_dim),
             nn.ReLU(),
             nn.Linear(latent_dim, latent_dim),
         )
-
-        # Learnable weights for combining neural vs memory predictions
         self.w_reward = nn.Parameter(torch.tensor(1.0))
         self.w_memory = nn.Parameter(torch.tensor(0.5))
 
@@ -1530,10 +1420,13 @@ class ActiveInferenceAgent(nn.Module):
         inp = torch.cat([z, a_onehot], dim=-1)
         return self.transition(inp)
 
-    def select_action(self, z: torch.Tensor,
-                      hypergraph: EternalHypergraph,
-                      temperature: float = 1.0,
-                      deterministic: bool = False) -> Tuple[int, Dict[str, Any]]:
+    def select_action(
+        self,
+        z: torch.Tensor,
+        hypergraph: EternalHypergraph,
+        temperature: float = 1.0,
+        deterministic: bool = False,
+    ):
         memory_q = hypergraph.get_action_values(z.detach(), self.n_actions)
         scores = []
         for a in range(self.n_actions):
@@ -1545,7 +1438,7 @@ class ActiveInferenceAgent(nn.Module):
             probs = torch.zeros_like(scores_t)
             probs[action] = 1.0
         else:
-            probs = torch.softmax(scores_t / max(temperature, 1e-6), dim=-1)
+            probs = torch.softmax(scores_t / temperature, dim=-1)
             action = int(torch.multinomial(probs, 1).item())
         return action, {
             "scores": scores_t.detach().cpu(),
@@ -1554,18 +1447,7 @@ class ActiveInferenceAgent(nn.Module):
         }
 
 
-# ---------------------------------------------------------------------
-# USM AGENT FOR GRIDWORLD
-# ---------------------------------------------------------------------
-
 class USMGridWorldAgent(nn.Module):
-    """
-    USM agent for GridWorld:
-    - Encodes observations to a latent z using a small MLP + CTMBlock.
-    - Uses ActiveInferenceAgent to choose actions given z and EternalHypergraph memories.
-    - Includes a small Q head for TD learning.
-    """
-
     def __init__(self, obs_dim: int, latent_dim: int, n_actions: int):
         super().__init__()
         self.obs_enc = nn.Sequential(
@@ -1583,14 +1465,15 @@ class USMGridWorldAgent(nn.Module):
         z_out, _, _, _ = self.ctm(z_seq, return_attn=False)
         return z_out.squeeze(1).squeeze(0)
 
-    def act(self, z: torch.Tensor, hypergraph: EternalHypergraph,
-            temperature: float = 1.0, deterministic: bool = False) -> Tuple[int, Dict[str, Any]]:
+    def act(
+        self,
+        z: torch.Tensor,
+        hypergraph: EternalHypergraph,
+        temperature: float = 1.0,
+        deterministic: bool = False,
+    ):
         return self.active.select_action(z, hypergraph, temperature, deterministic)
 
-
-# ---------------------------------------------------------------------
-# GRIDWORLD EXPERIMENT
-# ---------------------------------------------------------------------
 
 def run_gridworld_experiment(cfg: USMConfig):
     global device
@@ -1599,7 +1482,7 @@ def run_gridworld_experiment(cfg: USMConfig):
     random.seed(cfg.seed)
 
     print("=" * 60)
-    print("USM v1.3: GRIDWORLD + HYPERGRAPH + ACTIVE INFERENCE")
+    print("USM v1.4: GRIDWORLD + HYPERGRAPH + ACTIVE INFERENCE (toy)")
     print("=" * 60)
     print("Device:", device)
 
@@ -1631,10 +1514,8 @@ def run_gridworld_experiment(cfg: USMConfig):
             next_obs_t = tensorize(next_obs)
             z_next = agent.encode_latent(next_obs_t)
 
-            # Memory insertion
             hypergraph.add_experience(z, action, z_next, reward)
 
-            # Simple TD(0) on Q head
             q_pred = agent.q_head(z)
             q_val = q_pred[action]
             with torch.no_grad():
@@ -1654,14 +1535,13 @@ def run_gridworld_experiment(cfg: USMConfig):
         success_history.append(1.0 if success else 0.0)
 
         if ep % 20 == 0 or ep == cfg.gw_n_episodes:
-            n_recent = min(20, len(reward_history))
-            avg_r = sum(reward_history[-n_recent:]) / n_recent
-            avg_succ = sum(success_history[-n_recent:]) / n_recent
+            window = min(20, len(reward_history))
+            avg_r = sum(reward_history[-window:]) / window
+            avg_succ = sum(success_history[-window:]) / window
             print(
-                f"Episode {ep:3d} | "
-                f"avg_reward(last{n_recent})={avg_r:.3f} | "
-                f"success_rate(last{n_recent})={avg_succ*100:4.1f}% | "
-                f"mem_size={len(hypergraph.experience_ids)}"
+                f"Episode {ep:3d} | avg_reward(last{window})={avg_r:.3f} "
+                f"| success_rate(last{window})={avg_succ*100:4.1f}% "
+                f"| mem_size={len(hypergraph.experience_ids)}"
             )
 
     print("\n" + "=" * 60)
@@ -1675,6 +1555,10 @@ def run_gridworld_experiment(cfg: USMConfig):
 
 def main():
     cfg = USMConfig()
+    # you can tweak config here if you want, e.g.:
+    # cfg.hb_split_mode = "heldout_pairs"
+    # cfg.hb_num_heldout_patterns = 16
+
     if cfg.world_type == "hard_binding":
         run_hard_binding_experiment(cfg)
     elif cfg.world_type == "gridworld":
