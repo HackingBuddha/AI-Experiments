@@ -9,22 +9,41 @@ Original file is located at
 
 # @title
 # -*- coding: utf-8 -*-
-"""USM v1.2: Unified Science Machine
+"""USM v1.3: Unified Science Machine – Hard Binding CTM Core
 
-Hard Binding:
-  - 4-object relational binding task
-  - 2-layer CTM (fast+slow) with LTC, adaptive p, latent prediction loss
-  - Supervised query→object binding loss (annealed)
-  - Slot probes for color/shape/position
-  - Object-permutation invariance for training & eval
+This file implements:
 
-GridWorld:
-  - Minimal 5x5 GridWorld
-  - USMGridWorldAgent with CTMBlock encoder
-  - EternalHypergraph as experience memory
-  - ActiveInferenceAgent selecting actions from memory-based Q
+- Hard Binding world:
+    * 4 objects on a 5×5 grid
+    * Queries of the form: "What shape is <color> <rel> of <color>?"
+    * Ambiguous cases (multiple valid candidates) explicitly flagged.
+    * Optionally permutation-invariant training via shuffling object order.
 
-Single-file, Colab-friendly.
+- Models:
+    * MLP baseline.
+    * 2-layer CTM-ish slot model (fast + slow), with:
+        - LTC-like per-dim timescales.
+        - Adaptive p (sharpening) based on attention confidence.
+        - Latent prediction loss (z_t → z_{t+1}).
+        - Explicit query→object attention ("binding") head.
+        - Slot-level probes (color, shape, position).
+
+- Losses:
+    * Classification loss on answers.
+    * Latent prediction loss.
+    * Supervised binding loss (query attention vs cand_mask), with epoch-wise annealing.
+    * Slot-probe loss (decode per-object color/shape/position from slots).
+    * Optional attention entropy regularizer to discourage uniform attention.
+
+- Diagnostics:
+    * Separate accuracy on simple vs ambiguous scenes.
+    * Binding probe: attention argmax accuracy + mass on correct candidates.
+    * Slot probes: color/shape accuracy and position MSE.
+
+- Simple GridWorld + hypergraph + active inference agent kept as a second "world_type"
+  (lightweight, mainly to show how this CTM layer would plug into an agent loop).
+
+Everything is self-contained in one file / cell.
 """
 
 import math
@@ -44,7 +63,10 @@ from torch.utils.data import Dataset, DataLoader
 
 @dataclass
 class USMConfig:
+    # Which world to run
     world_type: str = "hard_binding"  # "hard_binding" or "gridworld"
+
+    # General
     seed: int = 0
     device: str = "cuda"
 
@@ -54,12 +76,24 @@ class USMConfig:
     hb_epochs: int = 100
     hb_batch_size: int = 256
     hb_lr: float = 1e-3
+
+    # Latent prediction loss
     hb_pred_loss_weight: float = 0.2
-    hb_permute_objects: bool = True
-    hb_bind_loss_weight: float = 1.0
-    hb_bind_loss_warmup_epochs: int = 20
-    hb_bind_loss_max_epochs: int = 80
-    hb_probe_loss_weight: float = 0.1
+
+    # Binding supervision
+    hb_bind_loss_weight_max: float = 3.0
+    hb_bind_loss_warmup_epochs: int = 10
+    hb_bind_loss_full_epoch: int = 60
+
+    # Slot probe supervision
+    hb_probe_loss_weight: float = 0.3
+
+    # Attention entropy regularizer (encourages sharper bindings)
+    hb_attn_entropy_weight: float = 0.03
+
+    # Permutation invariance: randomize object order at every sample
+    hb_permute_objects_train: bool = True
+    hb_permute_objects_eval: bool = True
 
     # GridWorld specific
     gw_size: int = 5
@@ -76,11 +110,11 @@ def resolve_device(cfg: USMConfig) -> torch.device:
     return torch.device("cpu")
 
 
-# default device (updated in main)
+# global device (updated in main)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ---------------------------------------------------------------------
-# HARD BINDING DATASET (with candidate mask + optional object permutation)
+# HARD BINDING DATASET
 # ---------------------------------------------------------------------
 
 class HardBindingDataset(Dataset):
@@ -100,18 +134,15 @@ class HardBindingDataset(Dataset):
       - shape index of one candidate object satisfying the relation.
       - Some scenes are ambiguous (multiple candidates) → marked separately.
 
-    Extra (for binding probes / supervision):
+    Extra (for binding probes, no gradient):
       - cand_mask: [4] bool, which object indices satisfy the relation.
 
-    Encoding:
+    Encoding (per sample, after optional permutation of objects):
       - 4 objects × (color one-hot 4 + shape one-hot 4 + x + y) = 4 × 10 = 40
       - query = target_color (4) + relation (4) + ref_color (4) = 12
       - total input dim = 52
-
-    permute_objects=True:
-      - At __getitem__ time, randomly permutes the 4 objects and cand_mask
-        to enforce permutation invariance and avoid slot-index cheating.
     """
+
     COLORS = ["red", "green", "blue", "yellow"]
     SHAPES = ["ball", "cube", "cone", "star"]
     RELS = ["left_of", "right_of", "above", "below"]
@@ -119,10 +150,15 @@ class HardBindingDataset(Dataset):
     def __init__(self, n_samples: int = 8000, seed: int = 0,
                  permute_objects: bool = False):
         self.n_samples = n_samples
-        self.permute_objects = permute_objects
         self.rng = random.Random(seed)
-        # Each sample: (x, y, ambiguous, cand_mask, objects, query)
-        self.samples: List[Tuple[torch.Tensor, int, bool, torch.Tensor, list, tuple]] = []
+        self.permute_objects = permute_objects
+
+        # Generate canonical (non-permuted) samples; permutation is applied in __getitem__
+        # Each sample: dict with keys:
+        #   "objects": list of 4 dicts {color, shape, x, y}
+        #   "target_color", "ref_color", "rel", "y" (shape idx),
+        #   "amb" (bool), "cand_mask" (torch.bool[4])
+        self.samples: List[Dict[str, Any]] = []
         self._generate()
 
     def _sample_coord(self) -> float:
@@ -142,7 +178,7 @@ class HardBindingDataset(Dataset):
             return y < ry and abs(x - rx) <= 0.4
         return False
 
-    def _generate_one(self):
+    def _generate_one(self) -> Dict[str, Any]:
         colors = self.COLORS
         shapes = self.SHAPES
         rels = self.RELS
@@ -169,8 +205,7 @@ class HardBindingDataset(Dataset):
             target_color = self.rng.choice(colors)
             rel = self.rng.choice(rels)
 
-            # Candidate targets: objects of target_color in relation
-            # to any object of ref_color
+            # Candidate targets: objects of target_color in relation to any object of ref_color
             candidates = []
             for i, obj in enumerate(objects):
                 if obj["color"] != target_color:
@@ -196,10 +231,44 @@ class HardBindingDataset(Dataset):
         answer_shape = objects[chosen_idx]["shape"]
         y = shapes.index(answer_shape)
 
-        # Candidate mask [4] for binding probes / supervision
         cand_mask = torch.zeros(4, dtype=torch.bool)
         for idx in candidates:
             cand_mask[idx] = True
+
+        return {
+            "objects": objects,
+            "target_color": target_color,
+            "ref_color": ref_color,
+            "rel": rel,
+            "y": y,
+            "amb": ambiguous,
+            "cand_mask": cand_mask,
+        }
+
+    def _generate(self):
+        self.samples = [self._generate_one() for _ in range(self.n_samples)]
+
+    def __len__(self):
+        return self.n_samples
+
+    def _encode_sample(self, sample: Dict[str, Any]) -> Tuple[torch.Tensor, int, bool, torch.Tensor]:
+        colors = self.COLORS
+        shapes = self.SHAPES
+        rels = self.RELS
+
+        objects = list(sample["objects"])  # shallow copy
+        cand_mask = sample["cand_mask"].clone()
+        y = sample["y"]
+        amb = sample["amb"]
+        target_color = sample["target_color"]
+        ref_color = sample["ref_color"]
+        rel = sample["rel"]
+
+        # Optional permutation of object order
+        if self.permute_objects:
+            perm = torch.randperm(4)
+            objects = [objects[i] for i in perm.tolist()]
+            cand_mask = cand_mask[perm]
 
         # Encode features
         feat = []
@@ -214,58 +283,33 @@ class HardBindingDataset(Dataset):
         feat.extend(tgt_oh + rel_oh + ref_oh)
 
         x = torch.tensor(feat, dtype=torch.float32)
-        query = (target_color, rel, ref_color)
-        return x, y, ambiguous, cand_mask, objects, query
-
-    def _generate(self):
-        self.samples = [self._generate_one() for _ in range(self.n_samples)]
-
-    def __len__(self):
-        return self.n_samples
+        return x, y, amb, cand_mask
 
     def __getitem__(self, idx):
-        x, y, amb, cand_mask, objects, query = self.samples[idx]
-        x = x.clone()
-        cand_mask = cand_mask.clone()
-
-        obj_colors_idx = torch.tensor(
-            [self.COLORS.index(obj["color"]) for obj in objects], dtype=torch.long
-        )
-        obj_shapes_idx = torch.tensor(
-            [self.SHAPES.index(obj["shape"]) for obj in objects], dtype=torch.long
-        )
-        obj_pos = torch.tensor(
-            [[obj["x"], obj["y"]] for obj in objects], dtype=torch.float32
-        )
-
-        if self.permute_objects:
-            obj_feats = x[:40].view(4, 10)
-            perm = torch.randperm(4)
-            obj_feats = obj_feats[perm]
-            x[:40] = obj_feats.view(-1)
-            cand_mask = cand_mask[perm]
-            obj_colors_idx = obj_colors_idx[perm]
-            obj_shapes_idx = obj_shapes_idx[perm]
-            obj_pos = obj_pos[perm]
-
-        return x, y, amb, cand_mask, obj_colors_idx, obj_shapes_idx, obj_pos
+        sample = self.samples[idx]
+        x, y, amb, cand_mask = self._encode_sample(sample)
+        return x, y, amb, cand_mask
 
     def sample_humans(self, k: int = 3):
-        """Return a few human-readable examples for logging."""
+        """Return a few human-readable examples for logging (canonical order)."""
         out = []
         for i in range(min(k, len(self.samples))):
-            x, y, amb, cand_mask, objects, query = self.samples[i]
-            out.append((objects, query, self.SHAPES[y], amb))
+            s = self.samples[i]
+            objects = s["objects"]
+            query = (s["target_color"], s["rel"], s["ref_color"])
+            answer = self.SHAPES[s["y"]]
+            amb = s["amb"]
+            out.append((objects, query, answer, amb))
         return out
 
 
-def ambig_fraction(ds: HardBindingDataset):
-    ambigs = sum(1 for _, _, amb, _, _, _ in ds.samples if amb)
+def ambig_fraction(ds: HardBindingDataset) -> Tuple[float, int]:
+    ambigs = sum(1 for s in ds.samples if s["amb"])
     return ambigs / len(ds.samples), ambigs
 
 
 # ---------------------------------------------------------------------
-# MODELS: MLP baseline
+# MODELS: MLP BASELINE
 # ---------------------------------------------------------------------
 
 class MLPBaseline(nn.Module):
@@ -284,7 +328,7 @@ class MLPBaseline(nn.Module):
 
 
 # ---------------------------------------------------------------------
-# CTM block: LTC + adaptive p + latent prediction
+# CTM BLOCK (with LTC dynamics + adaptive p + latent prediction loss)
 # ---------------------------------------------------------------------
 
 class CTMBlock(nn.Module):
@@ -336,33 +380,36 @@ class CTMBlock(nn.Module):
         for _ in range(self.n_ticks):
             h = self.pre_ln(self.in_proj(z))  # [B,T,d]
 
-            Q = self.q_proj(h)
+            Q = self.q_proj(h)  # [B,T,d]
             K = self.k_proj(h)
             V = self.v_proj(h)
 
+            # Base attention
             sim = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d)  # [B,T,T]
             attn = torch.softmax(sim, dim=-1)  # [B,T,T]
 
             # Attention peakiness → sync confidence
             row_max = attn.max(dim=-1).values  # [B,T]
             uniform = 1.0 / T
-            conf = (row_max.mean(dim=-1) - uniform) / (1.0 - uniform + 1e-6)
-            conf = conf.clamp(0.0, 1.0)  # [B]
+            conf = (row_max.mean(dim=-1) - uniform) / (1.0 - uniform + 1e-6)  # [B]
+            conf = conf.clamp(0.0, 1.0)
 
-            eff_p = self.p_min + (self.p_max - self.p_min) * conf
+            eff_p = self.p_min + (self.p_max - self.p_min) * conf  # [B]
             eff_ps.append(eff_p.detach())
 
+            # Adaptive p: sharpen or flatten the logits
             eff_p_exp = eff_p.view(B, 1, 1)
             sim_sharp = sim * eff_p_exp
-            attn_sharp = torch.softmax(sim_sharp, dim=-1)
-            last_attn = attn_sharp  # last tick attention
+            attn_sharp = torch.softmax(sim_sharp, dim=-1)  # [B,T,T]
+            last_attn = attn_sharp  # keep last tick's sharp attention
 
             context = torch.matmul(attn_sharp, V)  # [B,T,d]
             target = self.out_proj(context)        # [B,T,d]
 
-            # Latent prediction z_pred ≈ z_next
-            z_pred = self.pred_net(z)
+            # Latent prediction: z_pred ≈ z_next
+            z_pred = self.pred_net(z)  # [B,T,d]
 
+            # LTC update: dz/dt = (target - z) / τ
             dz = (target - z) / (tau + 1e-6)
             z_next = z + self.dt * dz
 
@@ -380,7 +427,7 @@ class CTMBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------
-# Hierarchical CTM model: 2 layers (fast + slow)
+# HIERARCHICAL CTM MODEL: 2 LAYERS (FAST + SLOW) + PROBES
 # ---------------------------------------------------------------------
 
 class CTMHierModel(nn.Module):
@@ -392,7 +439,8 @@ class CTMHierModel(nn.Module):
     - Total slots: 5 (4 objects + 1 query).
     - Layer 1: fast CTM (few ticks).
     - Layer 2: slow CTM (more ticks).
-    - Reads out from query slot after slow layer.
+    - Reads query→object attention from slow layer.
+    - Per-slot probes decode color/shape/position for interpretability.
     """
 
     def __init__(self, input_dim=52, slot_dim=32, n_slots=4, n_classes=4,
@@ -428,16 +476,16 @@ class CTMHierModel(nn.Module):
         # Per-slot shape head (object-wise logits)
         self.slot_shape_head = nn.Linear(slot_dim, n_classes)
 
-        # Diagnostic probe heads
-        self.probe_color = nn.Linear(self.slot_dim, 4)
-        self.probe_shape = nn.Linear(self.slot_dim, 4)
-        self.probe_pos = nn.Linear(self.slot_dim, 2)
+        # Slot probes: predict color, shape, position from each slot
+        self.probe_color_head = nn.Linear(slot_dim, 4)   # 4 colors
+        self.probe_shape_head = nn.Linear(slot_dim, 4)   # 4 shapes
+        self.probe_pos_head = nn.Linear(slot_dim, 2)     # (x,y)
 
     def encode_slots(self, x):
         """
         x: [B, 52]
         Returns:
-          z0: [B, 5, slot_dim]
+          z0:   [B, 5, slot_dim]
           slots 0..3: objects
           slot 4: query
         """
@@ -459,16 +507,19 @@ class CTMHierModel(nn.Module):
           pred_loss: scalar
           eff_p_mean: scalar
           attn_q2s: [B, n_slots] or None (query→object attention)
+          slots: [B, n_slots, D] or None
         """
         z = self.encode_slots(x)
         z, pred_loss_fast, eff_p_fast, _ = self.ctm_fast(z, return_attn=False)
+
+        # Always request attention from slow CTM to drive pointer-based readout
         z, pred_loss_slow, eff_p_slow, attn_last = self.ctm_slow(z, return_attn=True)
 
         pred_loss = pred_loss_fast + pred_loss_slow
         eff_p_mean = 0.5 * (eff_p_fast + eff_p_slow)
         slots = z[:, :self.n_slots, :]  # [B, n_slots, D]
 
-        # Query→slot attention (query row to object columns)
+        # Query→slot attention (from last slot row to the object slots)
         if attn_last is not None:
             q_idx = attn_last.shape[1] - 1
             obj_attn = attn_last[:, q_idx, :self.n_slots]  # [B, n_slots]
@@ -482,6 +533,7 @@ class CTMHierModel(nn.Module):
         # Pointer-style aggregation (log-space mix)
         log_p_slots = F.log_softmax(slot_logits, dim=-1)
         if attn_q2s is None:
+            # Fallback uniform attention if missing (should not happen in normal use)
             attn_q2s = torch.full(
                 (slots.size(0), self.n_slots),
                 1.0 / self.n_slots,
@@ -492,16 +544,20 @@ class CTMHierModel(nn.Module):
         final_logits = torch.logsumexp(joint_log, dim=1)  # [B, n_classes]
 
         if not return_attn:
-            attn_q2s = None
+            attn_out = None
+        else:
+            attn_out = attn_q2s
 
-        if return_slots:
-            return final_logits, pred_loss, eff_p_mean, attn_q2s, slots
+        if not return_slots:
+            slots_out = None
+        else:
+            slots_out = slots
 
-        return final_logits, pred_loss, eff_p_mean, attn_q2s
+        return final_logits, pred_loss, eff_p_mean, attn_out, slots_out
 
 
 # ---------------------------------------------------------------------
-# Classification evaluation
+# CLASSIFICATION EVALUATION
 # ---------------------------------------------------------------------
 
 def evaluate_model(model, loader, device):
@@ -511,12 +567,12 @@ def evaluate_model(model, loader, device):
     correct_amb = total_amb = 0
 
     with torch.no_grad():
-        for x, y, amb, cand_mask, _, _, _ in loader:
+        for x, y, amb, cand_mask in loader:
             x = x.to(device)
             y = y.to(device)
 
             if isinstance(model, CTMHierModel):
-                logits, _, _, _ = model(x)
+                logits, _, _, _, _ = model(x, return_attn=False, return_slots=False)
             else:
                 logits = model(x)
 
@@ -547,7 +603,7 @@ def evaluate_model(model, loader, device):
 
 
 # ---------------------------------------------------------------------
-# Binding evaluation (query-slot attention → object slots)
+# BINDING EVALUATION (query-slot attention → object slots)
 # ---------------------------------------------------------------------
 
 def evaluate_binding(ctm: CTMHierModel, loader, device, n_obj_slots: int = 4):
@@ -557,7 +613,10 @@ def evaluate_binding(ctm: CTMHierModel, loader, device, n_obj_slots: int = 4):
     For each sample:
       - Take attention from query slot row to the first n_obj_slots.
       - Binding-argmax is index of max attention among object slots.
-      - If that index is in cand_mask (a valid candidate), count as success.
+      - If that index is in cand_mask (one of the valid candidates), count as success.
+
+    Returns:
+      (overall_acc, simple_acc, amb_acc, overall_mass_on_correct)
     """
     ctm.eval()
     correct = total = 0
@@ -567,18 +626,19 @@ def evaluate_binding(ctm: CTMHierModel, loader, device, n_obj_slots: int = 4):
     mass_count = 0
 
     with torch.no_grad():
-        for x, y, amb, cand_mask, _, _, _ in loader:
+        for x, y, amb, cand_mask in loader:
             x = x.to(device)
             amb = amb.to(torch.bool)
             cand_mask = cand_mask.to(device)  # [B,4]
 
-            logits, _, _, attn_q2s = ctm(x, return_attn=True)
+            logits, _, _, attn_q2s, _ = ctm(x, return_attn=True, return_slots=False)
             if attn_q2s is None:
                 continue
 
             obj_attn = attn_q2s[:, :n_obj_slots]  # [B,4]
             B = obj_attn.shape[0]
 
+            # argmax binding
             max_idx = obj_attn.argmax(dim=-1)  # [B]
             batch_indices = torch.arange(B, device=device)
             correct_flags = cand_mask[batch_indices, max_idx]  # bool
@@ -586,10 +646,12 @@ def evaluate_binding(ctm: CTMHierModel, loader, device, n_obj_slots: int = 4):
             correct += correct_flags.sum().item()
             total += B
 
+            # attention mass on ANY correct candidate(s)
             mass_on_correct = (obj_attn * cand_mask.float()).sum(dim=-1)  # [B]
             mass_sum += mass_on_correct.sum().item()
             mass_count += B
 
+            # split simple vs amb
             simple_mask = ~amb
             amb_mask = amb
 
@@ -610,10 +672,6 @@ def evaluate_binding(ctm: CTMHierModel, loader, device, n_obj_slots: int = 4):
     return overall, simple, amb, mean_mass
 
 
-# ---------------------------------------------------------------------
-# Supervised binding loss
-# ---------------------------------------------------------------------
-
 def compute_binding_loss(attn_q2s: torch.Tensor,
                          cand_mask: torch.Tensor,
                          amb: torch.Tensor,
@@ -625,7 +683,6 @@ def compute_binding_loss(attn_q2s: torch.Tensor,
     - Ambiguous scenes: soft target over all valid candidates.
     """
     if attn_q2s is None:
-        # No attention (should not happen when return_attn=True)
         return torch.tensor(0.0, device=cand_mask.device)
 
     cand_mask = cand_mask.to(attn_q2s.device)
@@ -634,22 +691,22 @@ def compute_binding_loss(attn_q2s: torch.Tensor,
     simple_mask = ~amb
     loss_terms = []
 
-    # Simple: single candidate → NLL
+    # Simple: one-hot target
     if simple_mask.any():
         idx = simple_mask.nonzero(as_tuple=False).squeeze(-1)
-        attn_simple = attn_q2s[idx]           # [B_simple, n_slots]
-        cand_simple = cand_mask[idx].float()  # [B_simple, n_slots]
+        attn_simple = attn_q2s[idx]          # [B_simple,4]
+        cand_simple = cand_mask[idx].float() # [B_simple,4]
         target_idx = cand_simple.argmax(dim=-1)
         log_attn = (attn_simple + eps).log()
         ce_simple = F.nll_loss(log_attn, target_idx, reduction="mean")
         loss_terms.append(ce_simple)
 
-    # Ambiguous: multiple candidates → soft cross-entropy
+    # Ambiguous: soft target over valid candidates
     if amb.any():
         idx = amb.nonzero(as_tuple=False).squeeze(-1)
-        attn_amb = attn_q2s[idx]
+        attn_amb = attn_q2s[idx]            # [B_amb,4]
         cand_amb = cand_mask[idx].float()
-        cand_sum = cand_amb.sum(dim=-1, keepdim=True)  # [B_amb,1]
+        cand_sum = cand_amb.sum(dim=-1, keepdim=True)
         valid = cand_sum.squeeze(-1) > 0
         if valid.any():
             attn_amb = attn_amb[valid]
@@ -665,17 +722,120 @@ def compute_binding_loss(attn_q2s: torch.Tensor,
     return torch.stack(loss_terms).mean()
 
 
-def binding_weight_for_epoch(epoch: int, warmup: int, max_ep: int, max_w: float) -> float:
-    if epoch < warmup:
-        return 0.0
-    if epoch >= max_ep:
-        return max_w
-    alpha = (epoch - warmup) / max(1, max_ep - warmup)
-    return float(alpha * max_w)
+# ---------------------------------------------------------------------
+# SLOT PROBES (color/shape/position per slot)
+# ---------------------------------------------------------------------
+
+def compute_probe_loss(ctm: CTMHierModel,
+                       slots: torch.Tensor,
+                       x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Given final slots [B,4,D] and input x [B,52], decode:
+      - color index (0..3) per slot
+      - shape index (0..3) per slot
+      - position (x,y) per slot
+
+    Targets are read directly from the first 40 dims of x (object chunks).
+    """
+    if slots is None:
+        return torch.tensor(0.0, device=x.device), {"color_acc": 0.0, "shape_acc": 0.0, "pos_mse": 0.0}
+
+    B = x.size(0)
+    obj_feats = x[:, :40].view(B, 4, 10)      # [B,4,10]
+    color_oh = obj_feats[:, :, :4]            # [B,4,4]
+    shape_oh = obj_feats[:, :, 4:8]           # [B,4,4]
+    pos_gt = obj_feats[:, :, 8:10]            # [B,4,2]
+
+    color_target = color_oh.argmax(dim=-1)    # [B,4]
+    shape_target = shape_oh.argmax(dim=-1)    # [B,4]
+
+    color_logits = ctm.probe_color_head(slots)   # [B,4,4]
+    shape_logits = ctm.probe_shape_head(slots)   # [B,4,4]
+    pos_pred = ctm.probe_pos_head(slots)         # [B,4,2]
+
+    # Flatten over slots for classification
+    color_loss = F.cross_entropy(
+        color_logits.view(-1, 4),
+        color_target.view(-1),
+    )
+    shape_loss = F.cross_entropy(
+        shape_logits.view(-1, 4),
+        shape_target.view(-1),
+    )
+    pos_loss = F.mse_loss(pos_pred, pos_gt)
+
+    total_loss = (color_loss + shape_loss + pos_loss) / 3.0
+
+    # Simple metrics (used only for logging at epoch-level)
+    with torch.no_grad():
+        color_pred = color_logits.argmax(dim=-1)
+        shape_pred = shape_logits.argmax(dim=-1)
+        color_acc = (color_pred == color_target).float().mean().item()
+        shape_acc = (shape_pred == shape_target).float().mean().item()
+        pos_mse = F.mse_loss(pos_pred, pos_gt).item()
+
+    stats = {
+        "color_acc": color_acc,
+        "shape_acc": shape_acc,
+        "pos_mse": pos_mse,
+    }
+    return total_loss, stats
+
+
+def evaluate_probes(ctm: CTMHierModel, loader, device) -> Dict[str, float]:
+    ctm.eval()
+    total_color_correct = 0
+    total_shape_correct = 0
+    total_slots = 0
+    pos_mse_sum = 0.0
+    pos_count = 0
+
+    with torch.no_grad():
+        for x, y, amb, cand_mask in loader:
+            x = x.to(device)
+            logits, _, _, _, slots = ctm(x, return_attn=False, return_slots=True)
+            if slots is None:
+                continue
+
+            B = x.size(0)
+            obj_feats = x[:, :40].view(B, 4, 10)
+            color_oh = obj_feats[:, :, :4]
+            shape_oh = obj_feats[:, :, 4:8]
+            pos_gt = obj_feats[:, :, 8:10]
+
+            color_target = color_oh.argmax(dim=-1)   # [B,4]
+            shape_target = shape_oh.argmax(dim=-1)   # [B,4]
+
+            color_logits = ctm.probe_color_head(slots)
+            shape_logits = ctm.probe_shape_head(slots)
+            pos_pred = ctm.probe_pos_head(slots)
+
+            color_pred = color_logits.argmax(dim=-1)
+            shape_pred = shape_logits.argmax(dim=-1)
+
+            total_color_correct += (color_pred == color_target).sum().item()
+            total_shape_correct += (shape_pred == shape_target).sum().item()
+            total_slots += B * 4
+
+            pos_mse_sum += F.mse_loss(pos_pred, pos_gt, reduction="sum").item()
+            pos_count += B * 4 * 2
+
+    if total_slots == 0:
+        return {"color_acc": 0.0, "shape_acc": 0.0, "pos_mse": 0.0}
+
+    color_acc = total_color_correct / total_slots
+    shape_acc = total_shape_correct / total_slots
+    pos_mse = pos_mse_sum / pos_count
+
+    return {
+        "color_acc": color_acc,
+        "shape_acc": shape_acc,
+        "pos_mse": pos_mse,
+    }
 
 
 # ---------------------------------------------------------------------
-# HARD BINDING EXPERIMENT
+# HARD BINDING EXPERIMENT WRAPPER
 # ---------------------------------------------------------------------
 
 def run_hard_binding_experiment(cfg: USMConfig):
@@ -685,10 +845,8 @@ def run_hard_binding_experiment(cfg: USMConfig):
     random.seed(cfg.seed)
 
     print("=" * 60)
-    print(
-        "USM v1.2: HARD BINDING + 2-LAYER CTM + ADAPTIVE p + LATENT PRED"
-        " + BINDING LOSS (ANNEALED) + PROBES + PERM-INVARIANT"
-    )
+    print("USM v1.3: HARD BINDING + 2-LAYER CTM + ADAPTIVE p + LATENT PRED")
+    print("         + BINDING LOSS (ANNEALED) + SLOT PROBES + PERM-INVARIANT")
     print("=" * 60)
     print("Device:", device)
 
@@ -696,12 +854,12 @@ def run_hard_binding_experiment(cfg: USMConfig):
     train_ds = HardBindingDataset(
         n_samples=cfg.hb_train_samples,
         seed=cfg.seed,
-        permute_objects=cfg.hb_permute_objects,
+        permute_objects=cfg.hb_permute_objects_train,
     )
     eval_ds = HardBindingDataset(
         n_samples=cfg.hb_eval_samples,
         seed=cfg.seed + 1,
-        permute_objects=cfg.hb_permute_objects,
+        permute_objects=cfg.hb_permute_objects_eval,
     )
 
     amb_train, amb_train_n = ambig_fraction(train_ds)
@@ -715,6 +873,7 @@ def run_hard_binding_experiment(cfg: USMConfig):
     print(f"  Ambiguous fraction (train): {amb_train*100:.1f}% ({amb_train_n} cases)")
     print(f"  Ambiguous fraction (eval):  {amb_eval*100:.1f}% ({amb_eval_n} cases)")
 
+    # Show a few examples (canonical order)
     print("\n--- Examples ---\n")
     for objects, query, answer, amb in train_ds.sample_humans(3):
         qs = f"What shape is {query[0]} {query[1]} of {query[2]}?"
@@ -726,10 +885,18 @@ def run_hard_binding_experiment(cfg: USMConfig):
     train_loader = DataLoader(train_ds, batch_size=cfg.hb_batch_size, shuffle=True)
     eval_loader = DataLoader(eval_ds, batch_size=cfg.hb_batch_size, shuffle=False)
 
-    # Models
+    # -----------------------------------------------------------------
+    # MODELS
+    # -----------------------------------------------------------------
     mlp = MLPBaseline(input_dim=52, hidden=64, n_classes=4).to(device)
-    ctm = CTMHierModel(input_dim=52, slot_dim=32, n_slots=4, n_classes=4,
-                       n_ticks_fast=2, n_ticks_slow=3).to(device)
+    ctm = CTMHierModel(
+        input_dim=52,
+        slot_dim=32,
+        n_slots=4,
+        n_classes=4,
+        n_ticks_fast=2,
+        n_ticks_slow=3,
+    ).to(device)
 
     n_params_ctm = sum(p.numel() for p in ctm.parameters())
     n_params_mlp = sum(p.numel() for p in mlp.parameters())
@@ -738,9 +905,11 @@ def run_hard_binding_experiment(cfg: USMConfig):
     print("----------------------------------------")
     print(f"CTM: {n_params_ctm:,} params")
     print(f"MLP: {n_params_mlp:,} params")
-    print(f"Ratio: {n_params_ctm / max(1, n_params_mlp):.2f}x")
+    print(f"Ratio: {n_params_ctm / max(1,n_params_mlp):.2f}x")
 
-    # Train MLP baseline
+    # -----------------------------------------------------------------
+    # TRAIN MLP BASELINE
+    # -----------------------------------------------------------------
     print("\n----------------------------------------")
     print(f"TRAINING MLP ({cfg.hb_epochs} epochs)")
     print("----------------------------------------")
@@ -749,7 +918,7 @@ def run_hard_binding_experiment(cfg: USMConfig):
 
     for epoch in range(1, cfg.hb_epochs + 1):
         mlp.train()
-        for x, y, amb, cand_mask, _, _, _ in train_loader:
+        for x, y, amb, cand_mask in train_loader:
             x = x.to(device)
             y = y.to(device)
             opt_mlp.zero_grad()
@@ -765,17 +934,33 @@ def run_hard_binding_experiment(cfg: USMConfig):
                   f"Simple: {acc_simple*100:4.1f}% | "
                   f"Ambig: {acc_amb*100:4.1f}%")
 
-    # Train CTM (classification + latent pred + binding supervision)
+    # -----------------------------------------------------------------
+    # TRAIN CTM (with adaptive p + latent prediction + binding + probes)
+    # -----------------------------------------------------------------
     print("\n----------------------------------------")
-    print(f"TRAINING CTM ({cfg.hb_epochs} epochs)"
-          " + Adaptive p + Latent Pred Loss + Binding Loss")
+    print(
+        "TRAINING CTM "
+        f"({cfg.hb_epochs} epochs) + Adaptive p + Latent Pred Loss "
+        "+ Binding Loss (annealed) + Slot Probes"
+    )
     print("----------------------------------------")
 
     opt_ctm = torch.optim.AdamW(ctm.parameters(), lr=cfg.hb_lr)
     pred_loss_weight = cfg.hb_pred_loss_weight
-    bind_loss_weight_max = cfg.hb_bind_loss_weight
-    bind_warmup = cfg.hb_bind_loss_warmup_epochs
-    bind_max_ep = cfg.hb_bind_loss_max_epochs
+
+    def binding_weight_for_epoch(ep: int) -> float:
+        if ep <= cfg.hb_bind_loss_warmup_epochs:
+            return 0.0
+        if ep >= cfg.hb_bind_loss_full_epoch:
+            return cfg.hb_bind_loss_weight_max
+        # Linear ramp
+        t = (ep - cfg.hb_bind_loss_warmup_epochs) / max(
+            1,
+            (cfg.hb_bind_loss_full_epoch - cfg.hb_bind_loss_warmup_epochs),
+        )
+        return cfg.hb_bind_loss_weight_max * max(0.0, min(1.0, t))
+
+    last_probe_stats = {"color_acc": 0.0, "shape_acc": 0.0, "pos_mse": 0.0}
 
     for epoch in range(1, cfg.hb_epochs + 1):
         ctm.train()
@@ -784,49 +969,44 @@ def run_hard_binding_experiment(cfg: USMConfig):
         last_pred_loss_val = 0.0
         last_bind_loss_val = 0.0
         last_probe_loss_val = 0.0
+        last_attn_entropy = 0.0
         attn_debug_stats = None
-        bind_w = binding_weight_for_epoch(epoch, bind_warmup, bind_max_ep, bind_loss_weight_max)
 
-        for x, y, amb, cand_mask, obj_colors, obj_shapes, obj_pos in train_loader:
+        bind_w = binding_weight_for_epoch(epoch)
+
+        for x, y, amb, cand_mask in train_loader:
             x = x.to(device)
             y = y.to(device)
             amb = amb.to(device)
             cand_mask = cand_mask.to(device)
-            obj_colors = obj_colors.to(device)
-            obj_shapes = obj_shapes.to(device)
-            obj_pos = obj_pos.to(device)
 
-            # Always request attention; we need it for binding loss
             opt_ctm.zero_grad()
+            # Always get attention + slots for losses
             logits, pred_loss, eff_p_mean, attn_q2s, slots = ctm(
-                x, return_attn=True, return_slots=True
+                x,
+                return_attn=True,
+                return_slots=True,
             )
-
             loss_cls = ce(logits, y)
+
             bind_loss = compute_binding_loss(attn_q2s, cand_mask, amb)
+            probe_loss, probe_stats = compute_probe_loss(ctm, slots, x)
 
-            B, N, D = slots.shape
-            slots_flat = slots.reshape(B * N, D)
-            colors_flat = obj_colors.view(B * N)
-            shapes_flat = obj_shapes.view(B * N)
-            pos_flat = obj_pos.view(B * N, 2)
+            # Attention entropy (per sample, averaged)
+            if attn_q2s is not None:
+                attn_entropy = -(attn_q2s.clamp_min(1e-8) *
+                                 attn_q2s.clamp_min(1e-8).log()).sum(dim=-1).mean()
+            else:
+                attn_entropy = torch.tensor(0.0, device=x.device)
 
-            color_logits = ctm.probe_color(slots_flat)
-            shape_logits = ctm.probe_shape(slots_flat)
-            pos_pred = ctm.probe_pos(slots_flat)
-
-            loss_color = F.cross_entropy(color_logits, colors_flat)
-            loss_shape = F.cross_entropy(shape_logits, shapes_flat)
-            loss_pos = F.mse_loss(pos_pred, pos_flat)
-            probe_loss = loss_color + loss_shape + loss_pos
-
-            loss = (
+            total_loss = (
                 loss_cls
                 + pred_loss_weight * pred_loss
                 + bind_w * bind_loss
                 + cfg.hb_probe_loss_weight * probe_loss
+                + cfg.hb_attn_entropy_weight * attn_entropy
             )
-            loss.backward()
+            total_loss.backward()
             opt_ctm.step()
 
             running_eff_p += float(eff_p_mean)
@@ -834,6 +1014,8 @@ def run_hard_binding_experiment(cfg: USMConfig):
             last_pred_loss_val = pred_loss.detach().item()
             last_bind_loss_val = bind_loss.detach().item()
             last_probe_loss_val = probe_loss.detach().item()
+            last_attn_entropy = attn_entropy.detach().item()
+            last_probe_stats = probe_stats
 
             if attn_debug_stats is None and attn_q2s is not None:
                 with torch.no_grad():
@@ -852,17 +1034,23 @@ def run_hard_binding_experiment(cfg: USMConfig):
                 attn_min, attn_max, attn_sum_mean, attn_req_grad = attn_debug_stats
                 print(f"  [AttnDbg] min={attn_min:.4f} max={attn_max:.4f} "
                       f"mean_sum={attn_sum_mean:.4f} requires_grad={attn_req_grad}")
-            print(f"Epoch {epoch:3d} | CTM | "
-                  f"Eval: {acc*100:4.1f}% | "
-                  f"Simple: {acc_simple*100:4.1f}% | "
-                  f"Ambig: {acc_amb*100:4.1f}% | "
-                  f"PredLoss: {last_pred_loss_val:.4f} | "
-                  f"BindLoss: {last_bind_loss_val:.4f} | "
-                  f"ProbeLoss: {last_probe_loss_val:.4f} | "
-                  f"BindW: {bind_w:.3f} | "
-                  f"eff_p: {avg_eff_p:.2f}")
+            print(
+                f"Epoch {epoch:3d} | CTM | "
+                f"Eval: {acc*100:4.1f}% | "
+                f"Simple: {acc_simple*100:4.1f}% | "
+                f"Ambig: {acc_amb*100:4.1f}% | "
+                f"PredLoss: {last_pred_loss_val:.4f} | "
+                f"BindLoss: {last_bind_loss_val:.4f} | "
+                f"ProbeLoss: {last_probe_loss_val:.4f} | "
+                f"BindW: {bind_w:.3f} | "
+                f"AttnEnt: {last_attn_entropy:.3f} | "
+                f"eff_p: {avg_eff_p:.2f}")
+            avg_eff_p_final = avg_eff_p
+            pred_loss_final = last_pred_loss_val
 
-    # Final classification comparison
+    # -----------------------------------------------------------------
+    # FINAL CLASSIFICATION COMPARISON
+    # -----------------------------------------------------------------
     print("\n" + "=" * 60)
     print("DETAILED EVALUATION (CLASSIFICATION)")
     print("=" * 60)
@@ -893,13 +1081,18 @@ def run_hard_binding_experiment(cfg: USMConfig):
     print(f"  CTM: {ctm_amb*100:4.1f}%")
     print(f"  Diff: {(ctm_amb-mlp_amb)*100:4.1f}%")
 
-    # Binding probes
+    # -----------------------------------------------------------------
+    # BINDING PROBES
+    # -----------------------------------------------------------------
     print("\n" + "=" * 60)
     print("BINDING PROBES (QUERY ATTENTION → OBJECT SLOTS)")
     print("=" * 60)
 
     bind_overall, bind_simple, bind_amb, mass_mean = evaluate_binding(
-        ctm, eval_loader, device, n_obj_slots=4
+        ctm,
+        eval_loader,
+        device,
+        n_obj_slots=4,
     )
     print(f"\nBinding argmax accuracy (query attention to correct object):")
     print(f"  Overall: {bind_overall*100:4.1f}%")
@@ -907,52 +1100,17 @@ def run_hard_binding_experiment(cfg: USMConfig):
     print(f"  Ambig:   {bind_amb*100:4.1f}%")
     print(f"\nMean attention mass on correct candidate(s): {mass_mean*100:4.1f}%")
 
-    # Probe diagnostics
-    ctm.eval()
-    probe_color_correct = 0
-    probe_shape_correct = 0
-    probe_total = 0
-    pos_mse_sum = 0.0
-    pos_count = 0
-    with torch.no_grad():
-        for x, y, amb, cand_mask, obj_colors, obj_shapes, obj_pos in eval_loader:
-            x = x.to(device)
-            obj_colors = obj_colors.to(device)
-            obj_shapes = obj_shapes.to(device)
-            obj_pos = obj_pos.to(device)
-
-            _, _, _, _, slots = ctm(x, return_attn=False, return_slots=True)
-            B, N, D = slots.shape
-            slots_flat = slots.reshape(B * N, D)
-            colors_flat = obj_colors.view(B * N)
-            shapes_flat = obj_shapes.view(B * N)
-            pos_flat = obj_pos.view(B * N, 2)
-
-            color_logits = ctm.probe_color(slots_flat)
-            shape_logits = ctm.probe_shape(slots_flat)
-            pos_pred = ctm.probe_pos(slots_flat)
-
-            color_pred = color_logits.argmax(dim=-1)
-            shape_pred = shape_logits.argmax(dim=-1)
-
-            probe_color_correct += (color_pred == colors_flat).sum().item()
-            probe_shape_correct += (shape_pred == shapes_flat).sum().item()
-            probe_total += colors_flat.numel()
-
-            pos_mse_sum += F.mse_loss(pos_pred, pos_flat, reduction="sum").item()
-            pos_count += pos_flat.numel()
-
-    probe_color_acc = probe_color_correct / max(1, probe_total)
-    probe_shape_acc = probe_shape_correct / max(1, probe_total)
-    probe_pos_mse = pos_mse_sum / max(1, pos_count)
-
+    # -----------------------------------------------------------------
+    # SLOT PROBE METRICS
+    # -----------------------------------------------------------------
     print("\nPROBE METRICS (Slots → object attributes):")
-    print(f"  Color accuracy: {probe_color_acc*100:4.1f}%")
-    print(f"  Shape accuracy: {probe_shape_acc*100:4.1f}%")
-    print(f"  Position MSE:   {probe_pos_mse:.4f}")
+    probe_stats = evaluate_probes(ctm, eval_loader, device)
+    print(f"  Color accuracy: {probe_stats['color_acc']*100:4.1f}%")
+    print(f"  Shape accuracy: {probe_stats['shape_acc']*100:4.1f}%")
+    print(f"  Position MSE:   {probe_stats['pos_mse']:.4f}")
 
     print("\n" + "=" * 60)
-    print("v1.2 HARD BINDING COMPLETE")
+    print("v1.3 HARD BINDING COMPLETE")
     print("=" * 60)
 
 
@@ -963,11 +1121,13 @@ def run_hard_binding_experiment(cfg: USMConfig):
 class GridWorld:
     """
     Simple 2D grid world with a single agent and a fixed goal.
-
     - Grid size: cfg.gw_size x cfg.gw_size
     - State: one-hot agent position + one-hot goal position.
     - Actions: 0=up, 1=down, 2=left, 3=right.
-    - Reward: +1.0 on reaching goal, -0.01 per step otherwise.
+    - Reward:
+        +1.0 on reaching goal,
+        -0.01 per step otherwise.
+    - Episode ends when goal reached or max_steps exceeded.
     """
 
     def __init__(self, size: int = 5):
@@ -991,6 +1151,7 @@ class GridWorld:
         return torch.cat([agent_oh, goal_oh], dim=0)
 
     def step(self, action: int) -> Tuple[torch.Tensor, float, bool]:
+        # Move agent
         if action == 0:   # up
             self.agent_pos[0] = max(0, self.agent_pos[0] - 1)
         elif action == 1:  # down
@@ -1074,7 +1235,7 @@ class EternalHypergraph:
         embs = torch.stack([self.nodes[i].embedding for i in ids], dim=0).to(z.device)
         z_norm = F.normalize(z.unsqueeze(0), dim=-1)
         embs_norm = F.normalize(embs, dim=-1)
-        sims = torch.matmul(embs_norm, z_norm.transpose(0, 1)).squeeze(-1)
+        sims = torch.matmul(embs_norm, z_norm.transpose(0, 1)).squeeze(-1)  # [N]
         topk = torch.topk(sims, k=min(k, sims.numel()))
         return [self.nodes[ids[idx]] for idx in topk.indices.tolist()]
 
@@ -1103,10 +1264,11 @@ class EternalHypergraph:
 class ActiveInferenceAgent(nn.Module):
     """
     Lightweight Active Inference agent:
-    - Latent belief z comes from an encoder (here CTMBlock).
+    - Latent belief z ∈ R^D comes from a CTM encoder.
     - Has a small neural transition model f(z, a).
     - Uses EternalHypergraph as a memory-based world model.
-    - Selects actions via a simple score combining memory-based Q.
+    - Selects actions by minimizing a simple free energy objective (here: just
+      favor actions with high memory-based value).
     """
 
     def __init__(self, latent_dim: int, n_actions: int):
@@ -1145,7 +1307,7 @@ class ActiveInferenceAgent(nn.Module):
             probs = torch.zeros_like(scores_t)
             probs[action] = 1.0
         else:
-            probs = torch.softmax(scores_t / temperature, dim=-1)
+            probs = torch.softmax(scores_t / max(temperature, 1e-6), dim=-1)
             action = int(torch.multinomial(probs, 1).item())
         return action, {
             "scores": scores_t.detach().cpu(),
@@ -1155,15 +1317,15 @@ class ActiveInferenceAgent(nn.Module):
 
 
 # ---------------------------------------------------------------------
-# USM agent for GridWorld
+# USM AGENT FOR GRIDWORLD
 # ---------------------------------------------------------------------
 
 class USMGridWorldAgent(nn.Module):
     """
     USM agent for GridWorld:
-    - Encodes observations to latent z via MLP + CTMBlock.
-    - Uses ActiveInferenceAgent with EternalHypergraph memories.
-    - Has a Q head trained with TD(0).
+    - Encodes observations to a latent z using a small MLP + CTMBlock.
+    - Uses ActiveInferenceAgent to choose actions given z and EternalHypergraph memories.
+    - Includes a small Q head for TD learning.
     """
 
     def __init__(self, obs_dim: int, latent_dim: int, n_actions: int):
@@ -1178,8 +1340,8 @@ class USMGridWorldAgent(nn.Module):
         self.q_head = nn.Linear(latent_dim, n_actions)
 
     def encode_latent(self, obs: torch.Tensor) -> torch.Tensor:
-        z0 = self.obs_enc(obs.unsqueeze(0))   # [1,D]
-        z_seq = z0.unsqueeze(1)               # [1,1,D]
+        z0 = self.obs_enc(obs.unsqueeze(0))  # [1,D]
+        z_seq = z0.unsqueeze(1)              # [1,1,D]
         z_out, _, _, _ = self.ctm(z_seq, return_attn=False)
         return z_out.squeeze(1).squeeze(0)
 
@@ -1199,7 +1361,7 @@ def run_gridworld_experiment(cfg: USMConfig):
     random.seed(cfg.seed)
 
     print("=" * 60)
-    print("USM v1.1: GRIDWORLD + HYPERGRAPH + ACTIVE INFERENCE")
+    print("USM v1.3: GRIDWORLD + HYPERGRAPH + ACTIVE INFERENCE")
     print("=" * 60)
     print("Device:", device)
 
@@ -1234,7 +1396,7 @@ def run_gridworld_experiment(cfg: USMConfig):
             # Memory insertion
             hypergraph.add_experience(z, action, z_next, reward)
 
-            # TD(0) update on Q head
+            # Simple TD(0) on Q head
             q_pred = agent.q_head(z)
             q_val = q_pred[action]
             with torch.no_grad():
@@ -1254,12 +1416,15 @@ def run_gridworld_experiment(cfg: USMConfig):
         success_history.append(1.0 if success else 0.0)
 
         if ep % 20 == 0 or ep == cfg.gw_n_episodes:
-            span = min(20, len(reward_history))
-            avg_r = sum(reward_history[-span:]) / span
-            avg_succ = sum(success_history[-span:]) / span
-            print(f"Episode {ep:3d} | avg_reward(last{span})={avg_r:.3f} "
-                  f"| success_rate(last{span})={avg_succ*100:4.1f}% "
-                  f"| mem_size={len(hypergraph.experience_ids)}")
+            n_recent = min(20, len(reward_history))
+            avg_r = sum(reward_history[-n_recent:]) / n_recent
+            avg_succ = sum(success_history[-n_recent:]) / n_recent
+            print(
+                f"Episode {ep:3d} | "
+                f"avg_reward(last{n_recent})={avg_r:.3f} | "
+                f"success_rate(last{n_recent})={avg_succ*100:4.1f}% | "
+                f"mem_size={len(hypergraph.experience_ids)}"
+            )
 
     print("\n" + "=" * 60)
     print("GRIDWORLD TRAINING COMPLETE")
