@@ -10,7 +10,7 @@ Original file is located at
 # @title
 # -*- coding: utf-8 -*-
 """
-USM v1.4 (clean): Hard Binding CTM core + perm-invariant + binding loss + slot probes
+USM v1.5 (clean): Hard Binding CTM core + perm-invariant + binding loss + slot probes
 and an optional tiny GridWorld + hypergraph + Active Inference stub.
 
 Paste this as a single Colab cell and run.
@@ -46,12 +46,9 @@ class USMConfig:
     hb_lr: float = 1e-3
 
     hb_pred_loss_weight: float = 0.2
-    hb_probe_loss_weight: float = 0.5
-
-    # schedule for binding loss weight
-    hb_binding_loss_weight_base: float = 3.0
-    hb_binding_loss_epochs_warmup: int = 20   # start increasing after this
-    hb_binding_loss_epochs_full: int = 60     # fully on by here
+    hb_bind_loss_weight: float = 1.0
+    hb_probe_loss_weight: float = 0.1
+    hb_bind_warmup_epochs: int = 20
 
     # data augmentation / invariances
     hb_permute_objects: bool = True
@@ -274,6 +271,9 @@ class HardBindingDataset(Dataset):
           y: int
           amb: bool
           cand_mask: [4] bool
+          color_idx: [4] long
+          shape_idx: [4] long
+          pos_xy: [4,2] float32
         """
         s = self.samples[idx]
 
@@ -316,7 +316,10 @@ class HardBindingDataset(Dataset):
         x = torch.tensor(feat, dtype=torch.float32)
         y = int(s["y"])
         amb = bool(s["amb"])
-        return x, y, amb, cand_mask
+        color_idx = torch.tensor([colors.index(o["color"]) for o in objects], dtype=torch.long)
+        shape_idx = torch.tensor([shapes.index(o["shape"]) for o in objects], dtype=torch.long)
+        pos_xy = torch.tensor([[o["x"], o["y"]] for o in objects], dtype=torch.float32)
+        return x, y, amb, cand_mask, color_idx, shape_idx, pos_xy
 
 
 def ambig_fraction(ds: HardBindingDataset) -> Tuple[float, int]:
@@ -534,8 +537,8 @@ class CTMHierModel(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        return_attn: bool = False,
         return_slots: bool = False,
+        return_attn: bool = False,
     ):
         """
         x: [B, 52]
@@ -543,7 +546,7 @@ class CTMHierModel(nn.Module):
           logits: [B, n_classes]
           pred_loss: scalar
           eff_p_mean: scalar
-          attn_q2s: [B, n_slots] or None (query→object attention)
+          attn_q2s: [B, n_slots] (query→object attention)
           slots: [B, n_slots, D] or None
         """
         z = self.encode_slots(x)
@@ -556,39 +559,26 @@ class CTMHierModel(nn.Module):
         slots = z[:, :self.n_slots, :]   # [B, n_slots, D]
 
         # Query→slot attention (from last slot row to the object slots)
-        if attn_last is not None:
-            q_idx = attn_last.shape[1] - 1
-            obj_attn = attn_last[:, q_idx, :self.n_slots]  # [B, n_slots]
-            attn_q2s = obj_attn / (obj_attn.sum(dim=-1, keepdim=True) + 1e-8)
-        else:
-            attn_q2s = None
+        q_idx = attn_last.shape[1] - 1
+        obj_attn = attn_last[:, q_idx, :self.n_slots]  # [B, n_slots]
+        attn_q2s = obj_attn / (obj_attn.sum(dim=-1, keepdim=True) + 1e-8)
 
         # Per-slot logits over shapes
         slot_logits = self.slot_shape_head(slots)  # [B, n_slots, n_classes]
 
         # Pointer-style aggregation (log-space mix)
         log_p_slots = F.log_softmax(slot_logits, dim=-1)
-        if attn_q2s is None:
-            attn_q2s = torch.full(
-                (slots.size(0), self.n_slots),
-                1.0 / self.n_slots,
-                device=slots.device,
-            )
         log_attn = torch.log(attn_q2s.clamp_min(1e-8)).unsqueeze(-1)   # [B,n_slots,1]
         joint_log = log_p_slots + log_attn
         final_logits = torch.logsumexp(joint_log, dim=1)               # [B,n_classes]
-
-        if not return_attn:
-            attn_q2s_out = None
-        else:
-            attn_q2s_out = attn_q2s
 
         if not return_slots:
             slots_out = None
         else:
             slots_out = slots
+        attn_out = attn_last if return_attn else None
 
-        return final_logits, pred_loss, eff_p_mean, attn_q2s_out, slots_out
+        return final_logits, pred_loss, eff_p_mean, attn_q2s, slots_out if return_slots else None
 
 
 # ---------------------------------------------------------------------
@@ -602,7 +592,8 @@ def evaluate_model(model: nn.Module, loader, device: torch.device):
     correct_amb = total_amb = 0
 
     with torch.no_grad():
-        for x, y, amb, cand_mask in loader:
+        for batch in loader:
+            x, y, amb, *_ = batch
             x = x.to(device)
             y = y.to(device)
 
@@ -662,14 +653,13 @@ def evaluate_binding(
     mass_count = 0
 
     with torch.no_grad():
-        for x, y, amb, cand_mask in loader:
+        for batch in loader:
+            x, _, amb, cand_mask, *_ = batch
             x = x.to(device)
             amb = amb.to(torch.bool)
             cand_mask = cand_mask.to(device)  # [B,4]
 
             logits, _, _, attn_q2s, _ = ctm(x, return_attn=True, return_slots=False)
-            if attn_q2s is None:
-                continue
 
             obj_attn = attn_q2s[:, :n_obj_slots]  # [B,4]
             B = obj_attn.shape[0]
@@ -760,7 +750,8 @@ def evaluate_model_with_patterns(
     }
 
     with torch.no_grad():
-        for x, y, amb, cand_mask in loader:
+        for batch in loader:
+            x, y, amb, *_ = batch
             x = x.to(device)
             y = y.to(device)
 
@@ -801,7 +792,7 @@ def evaluate_model_with_patterns(
 # ---------------------------------------------------------------------
 
 def compute_binding_loss(
-    attn_q2s: Optional[torch.Tensor],
+    attn_q2s: torch.Tensor,
     cand_mask: torch.Tensor,
     amb: torch.Tensor,
     eps: float = 1e-8,
@@ -809,97 +800,67 @@ def compute_binding_loss(
     """
     Supervised binding loss for query→object attention.
 
-    - Simple scenes: cross-entropy to the single correct slot.
-    - Ambiguous scenes: soft target over all valid candidates.
+    Handles simple (single candidate), ambiguous (multiple candidates),
+    and degenerate (no candidate) cases robustly.
     """
-    if attn_q2s is None:
-        # no attention info; zero binding loss
-        return torch.tensor(0.0, device=cand_mask.device)
+    assert attn_q2s is not None, "attn_q2s must not be None"
+    assert attn_q2s.dim() == 2, "attn_q2s should be [B, n_slots]"
+    assert cand_mask.shape == attn_q2s.shape, "cand_mask shape mismatch"
 
+    attn_q2s = attn_q2s.to(dtype=torch.float32)
     cand_mask = cand_mask.to(attn_q2s.device)
     amb = amb.to(attn_q2s.device).bool()
 
     simple_mask = ~amb
-    loss_terms = []
+    losses = []
 
     if simple_mask.any():
         idx = simple_mask.nonzero(as_tuple=False).squeeze(-1)
-        attn_simple = attn_q2s[idx]           # [Ns,4]
-        cand_simple = cand_mask[idx].float()  # [Ns,4]
+        attn_simple = attn_q2s[idx]
+        cand_simple = cand_mask[idx].float()
         target_idx = cand_simple.argmax(dim=-1)
-        log_attn = (attn_simple + eps).log()
-        ce_simple = F.nll_loss(log_attn, target_idx, reduction="mean")
-        loss_terms.append(ce_simple)
+        ce_simple = F.nll_loss((attn_simple + eps).log(), target_idx, reduction="mean")
+        losses.append(ce_simple)
 
     if amb.any():
         idx = amb.nonzero(as_tuple=False).squeeze(-1)
-        attn_amb = attn_q2s[idx]             # [Na,4]
-        cand_amb = cand_mask[idx].float()    # [Na,4]
+        attn_amb = attn_q2s[idx]
+        cand_amb = cand_mask[idx].float()
         cand_sum = cand_amb.sum(dim=-1, keepdim=True)
-        valid = cand_sum.squeeze(-1) > 0
-        if valid.any():
-            attn_amb = attn_amb[valid]
-            cand_amb = cand_amb[valid]
-            cand_soft = cand_amb / (cand_sum[valid] + eps)
-            log_attn = (attn_amb + eps).log()
-            ce_amb = -(cand_soft * log_attn).sum(dim=-1).mean()
-            loss_terms.append(ce_amb)
+        valid = (cand_sum.squeeze(-1) > 0).nonzero(as_tuple=False).squeeze(-1)
+        if valid.numel() > 0:
+            attn_sel = attn_amb[valid]
+            cand_sel = cand_amb[valid]
+            cand_soft = cand_sel / (cand_sel.sum(dim=-1, keepdim=True) + eps)
+            ce_amb = -(cand_soft * (attn_sel + eps).log()).sum(dim=-1).mean()
+            losses.append(ce_amb)
 
-    if not loss_terms:
+    if not losses:
         return torch.tensor(0.0, device=attn_q2s.device)
-    return torch.stack(loss_terms).mean()
+    return torch.stack(losses).mean()
 
 
-def binding_weight_for_epoch(
-    epoch: int,
-    base: float,
-    warmup_epoch: int,
-    full_epoch: int,
-) -> float:
-    """
-    Simple annealing schedule:
-      - 0 until warmup_epoch
-      - ramp linearly from 0 → base between warmup_epoch and full_epoch
-      - stay at base afterwards
-    """
-    if epoch <= warmup_epoch:
-        return 0.0
-    if epoch >= full_epoch:
-        return base
-    frac = (epoch - warmup_epoch) / max(1.0, float(full_epoch - warmup_epoch))
-    return base * frac
+def attention_entropy(attn_q2s: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Average entropy of the query→slot attention."""
+    p = attn_q2s.clamp_min(eps)
+    return -(p * p.log()).sum(dim=-1).mean()
 
 
-def compute_probe_loss(ctm: CTMHierModel, slots: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """
-    Encourage each slot to retain object attributes:
-
-    From x we decode per-object:
-      - color idx ∈ [0..3]
-      - shape idx ∈ [0..3]
-      - position (x,y) ∈ [0,1]²
-
-    slots: [B, 4, D] (object slots only)
-    """
+def compute_probe_loss(
+    ctm: CTMHierModel,
+    slots: torch.Tensor,
+    color_idx: torch.Tensor,
+    shape_idx: torch.Tensor,
+    pos_xy: torch.Tensor,
+) -> torch.Tensor:
+    """Probe slots for object attributes (color, shape, position)."""
     if slots is None:
-        return torch.tensor(0.0, device=x.device)
-
-    B = x.size(0)
-    obj_dim = 10
-    obj_feats = x[:, :4 * obj_dim].view(B, 4, obj_dim)  # [B,4,10]
-
-    color_oh = obj_feats[:, :, 0:4]
-    shape_oh = obj_feats[:, :, 4:8]
-    pos = obj_feats[:, :, 8:10]
-
-    color_idx = color_oh.argmax(dim=-1)  # [B,4]
-    shape_idx = shape_oh.argmax(dim=-1)  # [B,4]
+        return torch.tensor(0.0, device=color_idx.device)
 
     color_logits = ctm.probe_color_head(slots)  # [B,4,n_colors]
     shape_logits = ctm.probe_shape_head(slots)  # [B,4,n_shapes]
     pos_pred = ctm.probe_pos_head(slots)        # [B,4,2]
 
-    # flatten B×4 → (B*4)
     color_loss = F.cross_entropy(
         color_logits.view(-1, color_logits.size(-1)),
         color_idx.view(-1),
@@ -908,19 +869,10 @@ def compute_probe_loss(ctm: CTMHierModel, slots: torch.Tensor, x: torch.Tensor) 
         shape_logits.view(-1, shape_logits.size(-1)),
         shape_idx.view(-1),
     )
-    pos_loss = F.mse_loss(pos_pred, pos)
+    pos_loss = F.mse_loss(pos_pred, pos_xy)
 
-    # heuristic weighting: position is continuous; give it a slightly higher factor
     loss = color_loss + shape_loss + 2.0 * pos_loss
     return loss
-
-
-def attention_entropy(attn_q2s: Optional[torch.Tensor]) -> float:
-    if attn_q2s is None:
-        return 0.0
-    p = attn_q2s.clamp_min(1e-8)
-    ent = -(p * p.log()).sum(dim=-1).mean().item()
-    return float(ent)
 
 
 # ---------------------------------------------------------------------
@@ -934,8 +886,8 @@ def run_hard_binding_experiment(cfg: USMConfig):
     random.seed(cfg.seed)
 
     print("=" * 60)
-    print("USM v1.4: HARD BINDING + 2-LAYER CTM + ADAPTIVE p + LATENT PRED")
-    print("         + BINDING LOSS (ANNEALED) + SLOT PROBES + PERM-INVARIANT")
+    print("USM v1.5: HARD BINDING + 2-LAYER CTM + ADAPTIVE p + LATENT PRED")
+    print("         + BINDING LOSS (WARMUP) + SLOT PROBES + PERM-INVARIANT")
     print("=" * 60)
     print("Device:", device)
 
@@ -1037,7 +989,7 @@ def run_hard_binding_experiment(cfg: USMConfig):
 
     for epoch in range(1, cfg.hb_epochs + 1):
         mlp.train()
-        for x, y, amb, cand_mask in train_loader:
+        for x, y, amb, cand_mask, color_idx, shape_idx, pos_xy in train_loader:
             x = x.to(device)
             y = y.to(device)
             opt_mlp.zero_grad()
@@ -1071,36 +1023,35 @@ def run_hard_binding_experiment(cfg: USMConfig):
         ctm.train()
         running_eff_p = 0.0
         running_batches = 0
-        last_pred_loss_val = 0.0
-        last_bind_loss_val = 0.0
-        last_probe_loss_val = 0.0
+        running_pred = 0.0
+        running_bind = 0.0
+        running_probe = 0.0
+        running_attn_ent = 0.0
         attn_debug_stats = None
-        attn_ent_val = 0.0
 
-        bind_w = binding_weight_for_epoch(
-            epoch,
-            base=cfg.hb_binding_loss_weight_base,
-            warmup_epoch=cfg.hb_binding_loss_epochs_warmup,
-            full_epoch=cfg.hb_binding_loss_epochs_full,
-        )
+        if epoch <= cfg.hb_bind_warmup_epochs:
+            bind_w = cfg.hb_bind_loss_weight * (epoch / cfg.hb_bind_warmup_epochs)
+        else:
+            bind_w = cfg.hb_bind_loss_weight
 
-        for x, y, amb, cand_mask in train_loader:
+        for x, y, amb, cand_mask, color_idx, shape_idx, pos_xy in train_loader:
             x = x.to(device)
             y = y.to(device)
             amb = amb.to(device)
             cand_mask = cand_mask.to(device)
-
-            want_attn = attn_debug_stats is None and (epoch % 20 == 0)
+            color_idx = color_idx.to(device)
+            shape_idx = shape_idx.to(device)
+            pos_xy = pos_xy.to(device)
 
             opt_ctm.zero_grad()
             logits, pred_loss, eff_p_mean, attn_q2s, slots = ctm(
                 x,
-                return_attn=want_attn,
+                return_attn=True,
                 return_slots=True,
             )
             loss_cls = ce(logits, y)
             bind_loss = compute_binding_loss(attn_q2s, cand_mask, amb)
-            probe_loss = compute_probe_loss(ctm, slots, x)
+            probe_loss = compute_probe_loss(ctm, slots, color_idx, shape_idx, pos_xy)
 
             loss = (
                 loss_cls
@@ -1113,13 +1064,13 @@ def run_hard_binding_experiment(cfg: USMConfig):
             opt_ctm.step()
 
             running_eff_p += float(eff_p_mean)
+            running_pred += float(pred_loss.detach())
+            running_bind += float(bind_loss.detach())
+            running_probe += float(probe_loss.detach())
+            running_attn_ent += float(attention_entropy(attn_q2s.detach()))
             running_batches += 1
-            last_pred_loss_val = pred_loss.detach().item()
-            last_bind_loss_val = bind_loss.detach().item()
-            last_probe_loss_val = probe_loss.detach().item()
-            attn_ent_val = attention_entropy(attn_q2s)
 
-            if want_attn and attn_q2s is not None:
+            if attn_debug_stats is None:
                 with torch.no_grad():
                     attn_sum = attn_q2s.sum(dim=-1)
                     attn_debug_stats = (
@@ -1132,6 +1083,10 @@ def run_hard_binding_experiment(cfg: USMConfig):
         if epoch % 20 == 0 or epoch == cfg.hb_epochs:
             acc, acc_simple, acc_amb = evaluate_model(ctm, eval_loader, device)
             avg_eff_p = running_eff_p / max(1, running_batches)
+            avg_pred = running_pred / max(1, running_batches)
+            avg_bind = running_bind / max(1, running_batches)
+            avg_probe = running_probe / max(1, running_batches)
+            avg_attn_ent = running_attn_ent / max(1, running_batches)
             if attn_debug_stats is not None:
                 attn_min, attn_max, attn_sum_mean, attn_req_grad = attn_debug_stats
                 print(
@@ -1143,11 +1098,11 @@ def run_hard_binding_experiment(cfg: USMConfig):
                 f"Eval: {acc*100:4.1f}% | "
                 f"Simple: {acc_simple*100:4.1f}% | "
                 f"Ambig: {acc_amb*100:4.1f}% | "
-                f"PredLoss: {last_pred_loss_val:.4f} | "
-                f"BindLoss: {last_bind_loss_val:.4f} | "
-                f"ProbeLoss: {last_probe_loss_val:.4f} | "
+                f"PredLoss: {avg_pred:.4f} | "
+                f"BindLoss: {avg_bind:.4f} | "
+                f"ProbeLoss: {avg_probe:.4f} | "
                 f"BindW: {bind_w:.3f} | "
-                f"AttnEnt: {attn_ent_val:.3f} | "
+                f"AttnEnt: {avg_attn_ent:.3f} | "
                 f"eff_p: {avg_eff_p:.2f}"
             )
 
@@ -1204,21 +1159,14 @@ def run_hard_binding_experiment(cfg: USMConfig):
     pos_se_sum = pos_count = 0.0
 
     with torch.no_grad():
-        for x, y, amb, cand_mask in eval_loader:
+        for x, _, _, _, color_idx, shape_idx, pos_xy in eval_loader:
             x = x.to(device)
+            color_idx = color_idx.to(device)
+            shape_idx = shape_idx.to(device)
+            pos_xy = pos_xy.to(device)
             logits, _, _, _, slots = ctm(x, return_attn=False, return_slots=True)
             if slots is None:
                 continue
-
-            B = x.size(0)
-            obj_dim = 10
-            obj_feats = x[:, :4 * obj_dim].view(B, 4, obj_dim)
-            color_oh = obj_feats[:, :, 0:4]
-            shape_oh = obj_feats[:, :, 4:8]
-            pos = obj_feats[:, :, 8:10]
-
-            color_idx = color_oh.argmax(dim=-1)  # [B,4]
-            shape_idx = shape_oh.argmax(dim=-1)  # [B,4]
 
             color_logits = ctm.probe_color_head(slots)  # [B,4,n_colors]
             shape_logits = ctm.probe_shape_head(slots)  # [B,4,n_shapes]
@@ -1233,7 +1181,7 @@ def run_hard_binding_experiment(cfg: USMConfig):
             shape_correct += (shape_pred == shape_idx).sum().item()
             shape_total += shape_idx.numel()
 
-            se = (pos_pred - pos) ** 2
+            se = (pos_pred - pos_xy) ** 2
             pos_se_sum += se.sum().item()
             pos_count += se.numel()
 
@@ -1275,7 +1223,7 @@ def run_hard_binding_experiment(cfg: USMConfig):
         )
 
     print("\n" + "=" * 60)
-    print("v1.4 HARD BINDING COMPLETE")
+    print("v1.5 HARD BINDING COMPLETE")
     print("=" * 60)
 
 
@@ -1482,7 +1430,7 @@ def run_gridworld_experiment(cfg: USMConfig):
     random.seed(cfg.seed)
 
     print("=" * 60)
-    print("USM v1.4: GRIDWORLD + HYPERGRAPH + ACTIVE INFERENCE (toy)")
+    print("USM v1.5: GRIDWORLD + HYPERGRAPH + ACTIVE INFERENCE (toy)")
     print("=" * 60)
     print("Device:", device)
 
