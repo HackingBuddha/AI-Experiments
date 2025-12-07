@@ -41,6 +41,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast
 
 # Device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -77,6 +78,7 @@ class USMConfig:
     # Batching Safety
     inference_batch_size: int = 4 # Pop chunk size
     max_support_per_step: int = 3 # Limit support examples per step to avoid OOM
+    use_mixed_precision: bool = True # Enable AMP during inference to reduce memory
 
     # --- Memory ---
     memory_capacity: int = 2000
@@ -306,6 +308,8 @@ class DarwinGodelController:
         sup_x_all, sup_y_all = task.get_train_batch(device)
         N_sup_total = sup_x_all.shape[0]
 
+        use_amp = cfg.use_mixed_precision and device.type == "cuda"
+
         # 1. Init Population
         z_pop = torch.randn(cfg.pop_size, cfg.z_dim, device=device) * 0.1
         task_key = self.model.get_task_key(sup_x_all[0].unsqueeze(0))
@@ -326,7 +330,7 @@ class DarwinGodelController:
         # 2. Evolution Loop
         for gen in range(cfg.inference_steps):
             opt.zero_grad()
-            total_fitness = torch.zeros(cfg.pop_size, device=device)
+            fitness_chunks = []
 
             # --- Sample Support Subset for TTT Step ---
             # To save memory, we don't process ALL support examples in every gradient step if N is huge.
@@ -350,17 +354,24 @@ class DarwinGodelController:
                 sup_y_exp = sup_y.repeat(curr_bs, 1, 1)
                 z_batch = pop_batch.repeat_interleave(N_sup_curr, dim=0)
 
-                logits, vq_loss = self.model(sup_x_exp, z_batch)
+                with autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                    logits, vq_loss = self.model(sup_x_exp, z_batch)
 
-                raw_loss = F.cross_entropy(logits, sup_y_exp, reduction='none')
-                loss_per_hyp = raw_loss.view(curr_bs, N_sup_curr, -1).mean(dim=2).sum(dim=1)
-                total_fitness[i:end] = loss_per_hyp + vq_loss
+                    raw_loss = F.cross_entropy(logits, sup_y_exp, reduction='none')
+                    loss_per_hyp = raw_loss.view(curr_bs, N_sup_curr, -1).mean(dim=2).sum(dim=1)
+                    fitness = loss_per_hyp + vq_loss
+
+                fitness_chunks.append(fitness)
 
                 del logits, raw_loss, sup_x_exp, sup_y_exp, z_batch
 
+            total_fitness = torch.cat(fitness_chunks, dim=0)
             loss = total_fitness.mean()
             loss.backward()
             opt.step()
+
+            if device.type == "cuda" and (gen + 1) % 5 == 0:
+                torch.cuda.empty_cache()
 
             # Genetic Step
             if gen % 5 == 0 and gen < cfg.inference_steps - 1:
@@ -393,6 +404,8 @@ class DarwinGodelController:
         q_x, q_y = task.get_test_batch(device)
         N_test = q_x.shape[0]
         with torch.no_grad():
+            if best_z is None:
+                best_z = z_pop.detach()[0].clone()
             z_test = best_z.unsqueeze(0).expand(N_test, -1)
             q_logits, _ = self.model(q_x, z_test)
             q_pred = q_logits.argmax(1)
